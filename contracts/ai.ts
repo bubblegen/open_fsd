@@ -14,6 +14,8 @@ export type CruiseChoice = "cruise_80" | "cruise_100" | "cruise_120" | "off";
 export interface PerceptionState {
   tick: number;
   gps: {
+    /** seconds since trip start (debug) */
+    elapsedS?: number;
     speedKmh: number;
     speedLimitKmh: number;
     roadName: string;
@@ -31,6 +33,8 @@ export interface PerceptionState {
   };
   traffic: {
     laneAhead: string;
+    /** EXPLICIT flag: true = no vehicle, no pedestrian, no obstacle at all */
+    viaDespejada: boolean;
     vehicleAhead: { type: string; distanceM: number; speedKmh: number } | null;
     oncomingVehicle: { type: string; distanceM: number; speedKmh: number } | null;
     emergencyVehicle: { type: string; distanceM: number; speedKmh: number } | null;
@@ -52,20 +56,28 @@ export const DECISION_QUESTIONS = {
   speed_action: {
     type: "choice",
     instructions:
-      "Eres el piloto automático de un Tesla. Según el GPS y el tráfico percibido, ¿cómo debe ajustar la velocidad AHORA MISMO? Respeta el límite de la vía y mantén distancia de seguridad.",
+      "Eres el piloto automático de un Tesla Model 3. Decides la velocidad cada segundo. " +
+      "REGLA DE ORO: frena ÚNICAMENTE si en el estado percibido hay un obstáculo REAL: " +
+      "peatón/perro a menos de 35 m cruzando hacia tu carril, o vehículo delante a menos de 25 m " +
+      "más lento que tú. " +
+      "Si traffic.viaDespejada es true (sin peatón y sin vehículo delante), ESTÁ PROHIBIDO frenar: " +
+      "elige accelerate si vas por debajo del límite-2, en caso contrario maintain. " +
+      "Una maniobra a más de 80 m NO es motivo para frenar. " +
+      "Nunca frenes por precaución general, por curvas lejanas ni por hipótesis: solo por lo que el estado lista explícitamente. " +
+      "En autopista/vía rápida despejada mantén velocidad de crucero, no frenes.",
     criteria: {
       accelerate:
-        "Acelerar para ARRANCAR desde parado (si la vía está despejada) o acercarse al límite de velocidad en un tramo despejado. NUNCA elegir si ya se va cerca del límite o hay obstáculos",
+        "Elegir SIEMPRE que la vía esté despejada (viaDespejada=true) y se vaya por debajo del límite-2, incluido arrancar desde 0 km/h. También para alcanzar la velocidad de crucero en vía rápida despejada. PROHIBIDO solo si hay obstáculo real cerca o se supera el límite",
       maintain:
-        "Mantener la velocidad actual SOLO si ya se circula a velocidad razonable y estable. NUNCA elegir estando parado (0 km/h)",
+        "Mantener la velocidad SOLO cuando se está cerca del límite (a menos de 2 km/h) o siguiendo un vehículo a distancia segura. PROHIBIDO estando parado (0 km/h) con la vía despejada: ahí toca accelerate",
       brake:
-        "Frenar o detenerse: hay un obstáculo, un peatón/perro cruzando, un coche lento, una maniobra próxima o un cruce peligroso",
+        "PROHIBIDO si viaDespejada=true. Solo permitido con obstáculo REAL en el estado: peatón/perro a <35 m con trayectoria hacia tu carril que no despeja antes de tu llegada, o vehículo delante a <25 m más lento, o peligro inminente. NUNCA por precaución, maniobras lejanas o vías despejadas",
     },
   },
   cruise: {
     type: "choice",
     instructions:
-      "¿Debe activar el control de crucero adaptativo y a qué velocidad? El crucero SOLO tiene sentido en vías rápidas (límite ≥ 90) y despejadas; en ciudad o tráfico denso debe estar apagado.",
+      "¿Debe activar el control de crucero adaptativo y a qué velocidad? El crucero SOLO tiene sentido en vías rápidas (límite ≥ 90) y despejadas (viaDespejada=true); en ciudad o con tráfico debe estar apagado.",
     criteria: {
       cruise_80: "Fijar el crucero a 80 km/h (vía rápida con tráfico moderado)",
       cruise_100: "Fijar el crucero a 100 km/h (vía rápida despejada)",

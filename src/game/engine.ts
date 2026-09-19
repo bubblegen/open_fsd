@@ -170,6 +170,8 @@ export class AutopilotGame {
   private lastDecisionSim = -999;
   private decisionSentWall = 0;
   private stoppedTime = 0;
+  private brakeTag: string | null = null;
+  public incidentCauses: Record<string, number> = {};
   private consecFails = 0;
   private errorNotified = false;
   private decisionEveryMs: number;
@@ -556,10 +558,11 @@ export class AutopilotGame {
           ? `Ocupada: ${veh.type} a ${veh.distanceM} m`
           : oncoming && oncoming.distanceM < 40
             ? "Tráfico en sentido contrario cercano"
-            : "Despejada";
+            : "Despejada: sin peatones ni vehículos delante";
     return {
       tick: this.tick,
       gps: {
+        elapsedS: Math.round(this.simTime),
         speedKmh: Math.round(this.speedKmh),
         speedLimitKmh: limit,
         roadName: this.currentRoadName(),
@@ -576,6 +579,7 @@ export class AutopilotGame {
       },
       traffic: {
         laneAhead,
+        viaDespejada: !ped && !veh,
         vehicleAhead: veh,
         oncomingVehicle: oncoming,
         emergencyVehicle: emerg,
@@ -750,6 +754,7 @@ export class AutopilotGame {
   private update(dt: number) {
     if (this.status === "ended") return;
 
+    this.brakeTag = null;
     this.simTime += dt;
     this.spawnTimer += dt;
     this.crossSpawnTimer += dt;
@@ -792,9 +797,10 @@ export class AutopilotGame {
           if (ds > 0 && ds < 16) v = Math.min(v, Math.max(1.0, (ds - 5) * 0.45));
         }
       }
-      // clamp accel/decel so braking chains are predictable
+      // clamp accel/decel so braking chains are predictable (4.5 m/s² max
+      // decel — a leader that slams less gives followers time to react)
       const dv = v - t.speedMs;
-      t.speedMs += Math.sign(dv) * Math.min(Math.abs(dv), 7 * dt);
+      t.speedMs += Math.sign(dv) * Math.min(Math.abs(dv), 4.5 * dt);
       t.s += t.dir * t.speedMs * dt;
     }
     this.traffic = this.traffic.filter((t) => {
@@ -861,11 +867,13 @@ export class AutopilotGame {
 
     if (this.emergency) {
       this.speedKmh = Math.max(0, this.speedKmh - EMERGENCY_BRAKE * dt);
+      this.brakeTag = "emergency";
     } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
       const target = Math.min(this.cruiseTargetKmh, limit + 10);
       const safeGap = (this.speedKmh / 3.6) * 2 + 6;
       if (veh && gapM < safeGap) {
         this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+        this.brakeTag = "cruise-gap";
       } else if (this.speedKmh < target - 2) {
         this.speedKmh = Math.min(target, this.speedKmh + ACCEL * dt);
       } else if (this.speedKmh > target + 2) {
@@ -879,12 +887,14 @@ export class AutopilotGame {
         case "accelerate": {
           // respect a safe following distance even when Jev says go;
           // approach the leader smoothly instead of brake-accel oscillation
-          const safeGap = (this.speedKmh / 3.6) * 1.8 + 5;
+          const safeGap = (this.speedKmh / 3.6) * 2.0 + 6;
           if (veh && gapM < safeGap * 0.7) {
             this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+            this.brakeTag = "acc-gap-hard";
           } else if (veh && gapM < safeGap && leaderV !== null) {
             if (this.speedKmh > leaderV + 1) {
               this.speedKmh = Math.max(leaderV, this.speedKmh - BRAKE * 0.6 * dt);
+              this.brakeTag = "acc-leader";
             } else if (this.speedKmh < leaderV - 2) {
               this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.7 * dt);
             }
@@ -893,19 +903,31 @@ export class AutopilotGame {
           }
           break;
         }
-        case "brake":
-          this.speedKmh = Math.max(0, this.speedKmh - BRAKE * (pedNow ? pedBrakeFactor : 1) * dt);
+        case "brake": {
+          // graduated comfort braking: only a true close conflict is a hard
+          // stop; a cautious "brake" from the model eases off instead of
+          // slamming to 0 km/h (which used to chain stop→creep→stop loops)
+          const factor = pedNow
+            ? pedBrakeFactor
+            : veh && gapM < 14
+              ? 1
+              : 0.5;
+          this.speedKmh = Math.max(0, this.speedKmh - BRAKE * factor * dt);
+          this.brakeTag = "jev-brake";
           break;
+        }
         case "maintain": {
           // never coast into the vehicle ahead: keep a safe gap and match it
-          const safeGap = (this.speedKmh / 3.6) * 1.8 + 5;
+          const safeGap = (this.speedKmh / 3.6) * 2.0 + 6;
           if (veh && gapM < safeGap * 0.75) {
             this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+            this.brakeTag = "maint-gap";
             break;
           }
           if (veh && gapM < safeGap && leaderV !== null) {
             if (this.speedKmh > leaderV + 1) {
               this.speedKmh = Math.max(leaderV, this.speedKmh - BRAKE * 0.7 * dt);
+              this.brakeTag = "maint-leader";
             } else if (this.speedKmh < leaderV - 3) {
               this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.7 * dt);
             }
@@ -929,6 +951,56 @@ export class AutopilotGame {
         }
       }
     }
+    // ── REFLEX LAYER (AEB): safety is not negotiated with the model ──
+    // Jev answers every ~1 s; a pedestrian stepping in between decisions must
+    // still trigger braking. If the pedestrian will be inside our corridor on
+    // arrival, cap our speed so we arrive just after they clear — no matter
+    // what accelCmd says. Same for a vehicle we're closing on too fast.
+    if (!this.emergency) {
+      const vMs = this.speedKmh / 3.6;
+      if (pedNow && pedNow.distanceM > 0.1 && pedNow.distanceM < 60) {
+        const ds = pedNow.distanceM;
+        // walkers heading for our lane get a wider early corridor so we shed
+        // speed PROGRESSIVELY (no last-metre emergency slam → no incidents);
+        // dogs are erratic → always wide corridor and a near-stop cap
+        const corridor = pedNow.closing || pedNow.kind === "perro" ? 2.7 : 1.7;
+        if (Math.abs(pedNow.lateralM) < corridor && pedNow.clearsInS > 0.05) {
+          const tArrive = ds / Math.max(vMs, 0.6);
+          if (pedNow.clearsInS > tArrive - 0.55) {
+            const cap = pedNow.kind === "perro" ? 3.0 : 4.5;
+            let vAllowMs = Math.min(ds / (pedNow.clearsInS + 0.45), cap);
+            // they are directly in front of us RIGHT NOW: stop behind them
+            // (creep to ~3 m), never roll through at crossing speed
+            if (Math.abs(pedNow.lateralM) < 1.1) {
+              vAllowMs = Math.min(vAllowMs, Math.max((ds - 3.2) / 1.5, 0));
+            }
+            if (vMs > vAllowMs + 0.25) {
+              const needMs2 = (vMs * vMs - vAllowMs * vAllowMs) / (2 * Math.max(ds - 1.5, 1));
+              // exact needed decel when possible; only a true close call (<12 m)
+              // deserves a hard stop
+              const floor = ds < 12 ? BRAKE * 0.8 : 6;
+              const decel = Math.min(EMERGENCY_BRAKE, Math.max(floor, needMs2 * 3.6));
+              this.speedKmh = Math.max(vAllowMs * 3.6, this.speedKmh - decel * dt);
+              this.brakeTag = "aeb-ped";
+            }
+          }
+        }
+      }
+      // vehicle AEB: any meaningful closing speed starts shedding EARLY and
+      // PROGRESSIVELY (exact needed decel), so we never reach bumper range
+      if (veh && gapM < 34) {
+        const leaderMs = leader ? leader.speedMs : 0;
+        const closingMs = vMs - leaderMs;
+        if (closingMs > 1.2) {
+          const needMs2 = (closingMs * closingMs) / (2 * Math.max(gapM - 5, 1));
+          const decel = Math.min(EMERGENCY_BRAKE, Math.max(5, needMs2 * 3.6));
+          if (vMs > leaderMs + 0.3) {
+            this.speedKmh = Math.max(leaderMs * 3.6, this.speedKmh - decel * dt);
+            this.brakeTag = "aeb-veh";
+          }
+        }
+      }
+    }
     // stuck detector: if we're stopped with nothing in front for a while,
     // Jev's last order can't be trusted — nudge to maintain, then accelerate
     if (this.speedKmh < 0.5) {
@@ -936,8 +1008,8 @@ export class AutopilotGame {
       const pedBlocking = pedStopped && Math.abs(pedStopped.lateralM) <= 2.2 && pedStopped.clearsInS > 1.2;
       if ((!veh || gapM > 12) && !pedBlocking) {
         this.stoppedTime += dt;
-        if (this.stoppedTime > 5 && this.accelCmd === "brake") this.accelCmd = "maintain";
-        if (this.stoppedTime > 10) this.accelCmd = "accelerate";
+        if (this.stoppedTime > 2.5 && this.accelCmd === "brake") this.accelCmd = "maintain";
+        if (this.stoppedTime > 6) this.accelCmd = "accelerate";
       } else {
         this.stoppedTime = 0;
       }
@@ -948,6 +1020,8 @@ export class AutopilotGame {
     const decel = (prevSpeed - this.speedKmh) / Math.max(dt, 0.001);
     if (decel > HARD_BRAKE_INCIDENT && this.lastDecel <= HARD_BRAKE_INCIDENT) {
       this.incidents++;
+      this.incidentCauses[this.brakeTag ?? "unknown"] =
+        (this.incidentCauses[this.brakeTag ?? "unknown"] ?? 0) + 1;
       this.score = Math.max(0, this.score - 25);
     }
     this.lastDecel = decel;
@@ -994,6 +1068,7 @@ export class AutopilotGame {
       this.incidents++;
       this.score = Math.max(0, this.score - 50);
       this.speedKmh = Math.max(0, leader ? leader.speedMs * 3.6 : 0);
+      this.brakeTag = "rear-end";
       if (leader) this.s = Math.min(this.s, leader.s - CAR_LEN_M - 0.3);
     }
 

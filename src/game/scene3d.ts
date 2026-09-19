@@ -544,10 +544,10 @@ export class Scene3D {
       const p = rs.poly.at(ss);
       const nx = Math.cos(p.angle + Math.PI / 2);
       const nz = Math.sin(p.angle + Math.PI / 2);
-      const off = side * (SIDEWALK_OUT + 1.8 + hash(n * 3.3) * 3.0);
+      const off = side * (SIDEWALK_OUT + 2.6 + hash(n * 3.3) * 2.6);
       const x = p.x + nx * off;
       const z = p.y + nz * off;
-      const scale = 1.15 + hash(n * 7.7) * 1.0;
+      const scale = 0.95 + hash(n * 7.7) * 0.7;
       trunkM.push(
         new THREE.Matrix4().makeTranslation(x, 1.2 * scale, z).multiply(
           new THREE.Matrix4().makeScale(scale, scale, scale),
