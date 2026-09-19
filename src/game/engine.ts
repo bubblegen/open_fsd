@@ -502,7 +502,14 @@ export class AutopilotGame {
     return null;
   }
 
-  private pedestrianAhead(): { kind: "persona" | "perro"; distanceM: number } | null {
+  /** nearest relevant pedestrian, with lateral geometry for smart braking */
+  private pedestrianAhead(): {
+    kind: "persona" | "perro";
+    distanceM: number;
+    lateralM: number; // distance from our lane centre (0 = in our path)
+    closing: boolean; // walking toward our lane
+    clearsInS: number; // seconds until clear of our lane corridor
+  } | null {
     let best: CrossingEntity | null = null;
     for (const c of this.crossings) {
       if (c.done) continue;
@@ -511,7 +518,18 @@ export class AutopilotGame {
       // reporting ones 100 m away made Jev brake forever and stall the trip
       if (ds > -2 && ds < 45 && (!best || Math.abs(ds) < Math.abs(best.s - this.s))) best = c;
     }
-    return best ? { kind: best.kind, distanceM: Math.round(best.s - this.s) } : null;
+    if (!best) return null;
+    const dir = Math.sign(best.to - best.from) || 1;
+    const lat = best.lateral - LANE;
+    const closing = dir > 0 ? lat < 0 : lat > 0;
+    // time until the pedestrian is outside our lane corridor (|lat| > 2.3 m)
+    let clearsInS: number;
+    if (Math.abs(lat) > 2.3) clearsInS = 0;
+    else {
+      const distToClear = 2.3 - Math.abs(lat);
+      clearsInS = distToClear / Math.max(best.speed, 0.1);
+    }
+    return { kind: best.kind, distanceM: Math.round(best.s - this.s), lateralM: Math.round(lat * 10) / 10, closing, clearsInS: Math.round(clearsInS * 10) / 10 };
   }
 
   private buildPerception(): PerceptionState {
@@ -523,7 +541,11 @@ export class AutopilotGame {
     const after = this.peekManeuver(1);
     const limit = this.currentLimit();
     const laneAhead = ped
-      ? `${ped.kind} cruzando la calzada`
+      ? Math.abs(ped.lateralM) > 2.3
+        ? `${ped.kind} cruzando, ya fuera de tu carril (${Math.abs(ped.lateralM).toFixed(0)} m)`
+        : ped.closing
+          ? `${ped.kind} a ${ped.distanceM} m cruzando HACIA tu carril, libre en ~${ped.clearsInS.toFixed(1)} s`
+          : `${ped.kind} a ${ped.distanceM} m alejándose de tu carril`
       : emerg
         ? `Vehículo de emergencia (${emerg.type}) acercándose`
         : veh && veh.distanceM < 40
@@ -814,10 +836,28 @@ export class AutopilotGame {
       this.stuckBehindS = Math.max(0, this.stuckBehindS - dt * 2);
     }
 
+    // pedestrian-aware brake gating: if Jev says brake but trajectory math
+    // shows the pedestrian will have cleared our lane corridor well before we
+    // get there, downgrade to maintain and glide — no needless full stop.
+    // Conversely, when a stop IS needed, brake progressively by distance.
+    const pedNow = this.pedestrianAhead();
+    let pedBrakeFactor = 1;
+    if (pedNow) {
+      const ds = pedNow.distanceM;
+      if (ds > 4) {
+        const tArrive = ds / Math.max(this.speedKmh / 3.6, 0.6);
+        const clearsBeforeArrival = pedNow.clearsInS < tArrive - 0.8;
+        if (clearsBeforeArrival && !this.emergency && this.accelCmd === "brake") {
+          this.accelCmd = "maintain";
+        }
+      }
+      // progressive: gentle far, firm close
+      pedBrakeFactor = ds < 10 ? 1 : ds < 22 ? 0.6 : 0.35;
+    }
+
     if (this.emergency) {
       this.speedKmh = Math.max(0, this.speedKmh - EMERGENCY_BRAKE * dt);
-    } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {
-      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
+    } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
       const target = Math.min(this.cruiseTargetKmh, limit + 10);
       const safeGap = (this.speedKmh / 3.6) * 2 + 6;
       if (veh && gapM < safeGap) {
@@ -850,7 +890,7 @@ export class AutopilotGame {
           break;
         }
         case "brake":
-          this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+          this.speedKmh = Math.max(0, this.speedKmh - BRAKE * (pedNow ? pedBrakeFactor : 1) * dt);
           break;
         case "maintain": {
           // never coast into the vehicle ahead: keep a safe gap and match it
@@ -868,9 +908,10 @@ export class AutopilotGame {
             break;
           }
           if (this.speedKmh < 6) {
-            const ped = this.pedestrianAhead();
-            if ((!veh || gapM > 9) && (!ped || ped.distanceM > 12)) {
-              // creep forward like a real Tesla in congestion
+            // creep once the pedestrian is clearing our corridor (or gone),
+            // not only when they are 12 m past us — shorter, realistic stops
+            const clear = !pedNow || Math.abs(pedNow.lateralM) > 2.2 || pedNow.clearsInS < 1.2;
+            if ((!veh || gapM > 9) && clear) {
               this.speedKmh = Math.min(10, this.speedKmh + 6 * dt);
               break;
             }
@@ -888,7 +929,8 @@ export class AutopilotGame {
     // Jev's last order can't be trusted — nudge to maintain, then accelerate
     if (this.speedKmh < 0.5) {
       const pedStopped = this.pedestrianAhead();
-      if ((!veh || gapM > 12) && (!pedStopped || pedStopped.distanceM > 14)) {
+      const pedBlocking = pedStopped && Math.abs(pedStopped.lateralM) <= 2.2 && pedStopped.clearsInS > 1.2;
+      if ((!veh || gapM > 12) && !pedBlocking) {
         this.stoppedTime += dt;
         if (this.stoppedTime > 5 && this.accelCmd === "brake") this.accelCmd = "maintain";
         if (this.stoppedTime > 10) this.accelCmd = "accelerate";

@@ -34,7 +34,16 @@ export interface PerceptionState {
     vehicleAhead: { type: string; distanceM: number; speedKmh: number } | null;
     oncomingVehicle: { type: string; distanceM: number; speedKmh: number } | null;
     emergencyVehicle: { type: string; distanceM: number; speedKmh: number } | null;
-    pedestrian: { kind: "persona" | "perro"; distanceM: number } | null;
+    pedestrian: {
+      kind: "persona" | "perro";
+      distanceM: number;
+      /** metres from the car's lane centre; 0 = directly in our path */
+      lateralM?: number;
+      /** walking toward our lane right now */
+      closing?: boolean;
+      /** seconds until the pedestrian clears our lane corridor */
+      clearsInS?: number;
+    } | null;
   };
 }
 

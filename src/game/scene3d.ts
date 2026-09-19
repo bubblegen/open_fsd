@@ -32,18 +32,19 @@ function glowTexture(color: string): THREE.CanvasTexture {
   return t;
 }
 
-/** night sky gradient: deep navy zenith → city-glow horizon (GTA-style) */
+/** dusk sky gradient: indigo zenith → violet → warm amber horizon (GTA-style) */
 function skyTexture(): THREE.CanvasTexture {
   const c = document.createElement("canvas");
   c.width = 4;
   c.height = 512;
   const g = c.getContext("2d")!;
   const grad = g.createLinearGradient(0, 0, 0, 512);
-  grad.addColorStop(0.0, "#020409");
-  grad.addColorStop(0.45, "#071022");
-  grad.addColorStop(0.72, "#0e2240");
-  grad.addColorStop(0.88, "#27436b");
-  grad.addColorStop(1.0, "#7a5a3a");
+  grad.addColorStop(0.0, "#0b1026");
+  grad.addColorStop(0.38, "#1c2450");
+  grad.addColorStop(0.62, "#3d3a6e");
+  grad.addColorStop(0.8, "#7a4e6e");
+  grad.addColorStop(0.92, "#c96a3e");
+  grad.addColorStop(1.0, "#f0a04a");
   g.fillStyle = grad;
   g.fillRect(0, 0, 4, 512);
   const t = new THREE.CanvasTexture(c);
@@ -78,17 +79,17 @@ function windowsTexture(): THREE.CanvasTexture {
   return t;
 }
 
-/** subtle asphalt noise */
+/** asphalt noise with visible aggregate */
 function asphaltTexture(): THREE.CanvasTexture {
   const c = document.createElement("canvas");
   c.width = c.height = 256;
   const g = c.getContext("2d")!;
-  g.fillStyle = "#3a3f47";
+  g.fillStyle = "#5c626c";
   g.fillRect(0, 0, 256, 256);
-  for (let i = 0; i < 5200; i++) {
-    const v = 40 + Math.floor(hash(i * 1.37) * 40);
-    g.fillStyle = `rgba(${v},${v + 3},${v + 8},${0.16 + hash(i * 2.9) * 0.2})`;
-    g.fillRect(hash(i * 3.7) * 256, hash(i * 7.1) * 256, 1.4, 1.4);
+  for (let i = 0; i < 6200; i++) {
+    const v = 74 + Math.floor(hash(i * 1.37) * 52);
+    g.fillStyle = `rgba(${v},${v + 3},${v + 8},${0.2 + hash(i * 2.9) * 0.24})`;
+    g.fillRect(hash(i * 3.7) * 256, hash(i * 7.1) * 256, 1.5, 1.5);
   }
   const t = new THREE.CanvasTexture(c);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
@@ -137,20 +138,21 @@ export class Scene3D {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.4;
+    this.renderer.toneMappingExposure = 1.25;
 
     this.camera = new THREE.PerspectiveCamera(60, 16 / 9, 0.5, 900);
-    this.scene.background = new THREE.Color(0x05070d);
-    this.scene.fog = new THREE.Fog(0x05070d, 80, 420);
+    this.scene.background = new THREE.Color(0x1f1a2e);
+    this.scene.fog = new THREE.Fog(0x241d33, 90, 520);
 
-    const hemi = new THREE.HemisphereLight(0x46536e, 0x11141a, 1.7);
+    // golden-hour dusk: warm low sun + cool sky fill
+    const hemi = new THREE.HemisphereLight(0x8fa3c8, 0x4a3f30, 1.5);
     this.scene.add(hemi);
-    const moon = new THREE.DirectionalLight(0x9db2d4, 1.0);
-    moon.position.set(-80, 120, -60);
-    this.scene.add(moon);
-    this.scene.add(new THREE.AmbientLight(0x1c2430, 1.4));
+    const sun = new THREE.DirectionalLight(0xffbe78, 2.6);
+    sun.position.set(-120, 90, -80);
+    this.scene.add(sun);
+    this.scene.add(new THREE.AmbientLight(0x3a3f52, 0.9));
 
-    // night sky dome + stars
+    // dusk sky dome + stars
     const sky = new THREE.Mesh(
       new THREE.SphereGeometry(860, 24, 16),
       new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false, depthWrite: false }),
@@ -203,7 +205,7 @@ export class Scene3D {
 
     // ground plane follows the car
     const groundGeo = new THREE.PlaneGeometry(1400, 1400);
-    const groundMat = new THREE.MeshLambertMaterial({ color: 0x171a20 });
+    const groundMat = new THREE.MeshLambertMaterial({ color: 0x373c45 });
     this.ground = new THREE.Mesh(groundGeo, groundMat);
     this.ground.rotation.x = -Math.PI / 2;
     this.world.add(this.ground);
@@ -277,19 +279,21 @@ export class Scene3D {
       return mesh;
     };
     // sidewalks then road (road slightly higher to avoid z-fighting)
-    add(this.stripGeometry(pts, ROAD_HALF, SIDEWALK_OUT, 0.012), 0x343941);
-    add(this.stripGeometry(pts, -SIDEWALK_OUT, -ROAD_HALF, 0.012), 0x343941);
-    // asphalt with subtle noise texture, repeated every ~14 m
+    add(this.stripGeometry(pts, ROAD_HALF, SIDEWALK_OUT, 0.012), 0x5c616b);
+    add(this.stripGeometry(pts, -SIDEWALK_OUT, -ROAD_HALF, 0.012), 0x5c616b);
+    // asphalt with aggregate noise, repeated every ~14 m
     const asphalt = asphaltTexture();
     const roadMesh = new THREE.Mesh(
       this.stripGeometry(pts, -ROAD_HALF, ROAD_HALF, 0.028, 14),
-      new THREE.MeshLambertMaterial({ map: asphalt, color: 0xb9bec6 }),
+      new THREE.MeshLambertMaterial({ map: asphalt, color: 0xe2e6ec }),
     );
     this.world.add(roadMesh);
 
-    // edge lines
-    add(this.stripGeometry(pts, ROAD_HALF - 0.2, ROAD_HALF - 0.05, 0.042), 0x6f7681);
-    add(this.stripGeometry(pts, -ROAD_HALF + 0.05, -ROAD_HALF + 0.2, 0.042), 0x6f7681);
+    // bright curb faces + edge lines
+    add(this.stripGeometry(pts, ROAD_HALF + 0.02, ROAD_HALF + 0.14, 0.042), 0x878d98);
+    add(this.stripGeometry(pts, -ROAD_HALF - 0.14, -ROAD_HALF - 0.02, 0.042), 0x878d98);
+    add(this.stripGeometry(pts, ROAD_HALF - 0.22, ROAD_HALF - 0.06, 0.042), 0xdfe4ec);
+    add(this.stripGeometry(pts, -ROAD_HALF + 0.06, -ROAD_HALF + 0.22, 0.042), 0xdfe4ec);
 
     // center dashes
     const dashPos: number[] = [];
@@ -313,7 +317,7 @@ export class Scene3D {
     const dashGeo = new THREE.BufferGeometry();
     dashGeo.setAttribute("position", new THREE.Float32BufferAttribute(dashPos, 3));
     dashGeo.setIndex(dashIdx);
-    add(dashGeo, 0xb9bfc9);
+    add(dashGeo, 0xf2f5fa);
 
     // crosswalks + cross streets at maneuver points
     const manS = stepsToS(rs);
@@ -351,7 +355,7 @@ export class Scene3D {
         );
         g.setIndex([0, 1, 2, 1, 3, 2]);
         g.computeVertexNormals();
-        const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: 0x9aa0aa }));
+        const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ color: 0xe8ecf3 }));
         this.world.add(m);
       }
       // crossing street stub (explicit quad along the road normal)
@@ -372,7 +376,7 @@ export class Scene3D {
       );
       sg.setIndex([0, 1, 2, 1, 3, 2]);
       sg.computeVertexNormals();
-      const stubM = new THREE.Mesh(sg, new THREE.MeshLambertMaterial({ color: 0x181b20 }));
+      const stubM = new THREE.Mesh(sg, new THREE.MeshLambertMaterial({ color: 0x33383f }));
       this.world.add(stubM);
     }
   }
@@ -448,8 +452,8 @@ export class Scene3D {
         const trans = new THREE.Matrix4().makeTranslation(p.x + nx * off, height / 2, p.y + nz * off);
         m.copy(trans).multiply(rot).multiply(scale);
         mats.push(m);
-        const shade = 0.17 + h2 * 0.15;
-        color.setRGB(shade * 0.9, shade, shade * 1.25);
+        const shade = 0.32 + h2 * 0.22;
+        color.setRGB(shade * 1.05, shade, shade * 0.88);
         colors.push(color.clone());
       }
     }
@@ -462,14 +466,14 @@ export class Scene3D {
       map: facades,
       emissive: 0xffffff,
       emissiveMap: facades,
-      emissiveIntensity: 0.34,
+      emissiveIntensity: 0.55,
     });
     const inst = new THREE.InstancedMesh(geo, mat, mats.length);
     mats.forEach((m, i) => {
       inst.setMatrixAt(i, m);
-      // darken the facade a bit but keep window glow readable
+      // dusk-lit facades with window glow readable
       const c = colors[i];
-      inst.setColorAt(i, new THREE.Color(c.r * 0.55, c.g * 0.55, c.b * 0.6));
+      inst.setColorAt(i, new THREE.Color(c.r * 0.85, c.g * 0.8, c.b * 0.78));
     });
     inst.instanceMatrix.needsUpdate = true;
     if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
@@ -526,39 +530,39 @@ export class Scene3D {
     const trunkM: THREE.Matrix4[] = [];
     const leafM: THREE.Matrix4[] = [];
     let n = 0;
-    for (let s = 24; s < rs.poly.total - 20; s += 30, n++) {
-      const jitter = hash(n * 5.13) * 14;
+    for (let s = 20; s < rs.poly.total - 16; s += 21, n++) {
+      const jitter = hash(n * 5.13) * 12;
       const ss = s + jitter;
       if (nearMan(ss) || this.limitAt(rs, ss) >= 80) continue;
-      if (hash(n * 9.7) < 0.25) continue; // gaps
+      if (hash(n * 9.7) < 0.14) continue; // few gaps
       const side = n % 2 === 0 ? 1 : -1;
       const p = rs.poly.at(ss);
       const nx = Math.cos(p.angle + Math.PI / 2);
       const nz = Math.sin(p.angle + Math.PI / 2);
-      const off = side * (SIDEWALK_OUT + 2.4 + hash(n * 3.3) * 3.5);
+      const off = side * (SIDEWALK_OUT + 1.8 + hash(n * 3.3) * 3.0);
       const x = p.x + nx * off;
       const z = p.y + nz * off;
-      const scale = 0.8 + hash(n * 7.7) * 0.7;
+      const scale = 1.15 + hash(n * 7.7) * 1.0;
       trunkM.push(
-        new THREE.Matrix4().makeTranslation(x, 0.8 * scale, z).multiply(
+        new THREE.Matrix4().makeTranslation(x, 1.2 * scale, z).multiply(
           new THREE.Matrix4().makeScale(scale, scale, scale),
         ),
       );
       leafM.push(
-        new THREE.Matrix4().makeTranslation(x, (1.6 + 1.9) * scale, z).multiply(
+        new THREE.Matrix4().makeTranslation(x, (2.4 + 2.6) * scale, z).multiply(
           new THREE.Matrix4().makeScale(scale, scale * (0.9 + hash(n * 2.1) * 0.4), scale),
         ),
       );
     }
     if (trunkM.length === 0) return;
     const trunks = new THREE.InstancedMesh(
-      new THREE.CylinderGeometry(0.14, 0.22, 1.6, 6),
-      new THREE.MeshLambertMaterial({ color: 0x41321f }),
+      new THREE.CylinderGeometry(0.2, 0.32, 2.4, 6),
+      new THREE.MeshLambertMaterial({ color: 0x5a4630 }),
       trunkM.length,
     );
     const leaves = new THREE.InstancedMesh(
-      new THREE.ConeGeometry(1.5, 3.8, 7),
-      new THREE.MeshLambertMaterial({ color: 0x1d3a24 }),
+      new THREE.ConeGeometry(2.3, 6.2, 7),
+      new THREE.MeshLambertMaterial({ color: 0x3f8f4c, emissive: 0x0e2413 }),
       leafM.length,
     );
     trunkM.forEach((m, i) => trunks.setMatrixAt(i, m));
@@ -635,7 +639,7 @@ export class Scene3D {
   private makeVehicle(kind: string, colorHex: string): VehicleMesh {
     const g = new THREE.Group();
     const bodyMat = new THREE.MeshLambertMaterial({ color: new THREE.Color(colorHex) });
-    const glassMat = new THREE.MeshLambertMaterial({ color: 0x0e1420 });
+    const glassMat = new THREE.MeshLambertMaterial({ color: 0x27333f });
 
     const body = new THREE.Mesh(new THREE.BoxGeometry(1.86, 0.55, 4.5), bodyMat);
     body.position.y = 0.55;
@@ -721,7 +725,7 @@ export class Scene3D {
   }
 
   private buildTesla() {
-    const v = this.makeVehicle("car", "#8a94a6"); // pearl grey so the Tesla reads at night
+    const v = this.makeVehicle("car", "#e8ecf4"); // pearl white so the Tesla reads at dusk
     // sleeker cabin
     v.group.children[1].scale.set(0.92, 0.8, 1.05);
     // autopilot ring under the car
