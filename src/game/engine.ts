@@ -6,6 +6,7 @@ import {
   createProjection,
   stepsWithS,
   limitForStep,
+  roadHalfAt,
   instructionFor,
   type Projection,
 } from "./geo";
@@ -172,6 +173,8 @@ export class AutopilotGame {
   private stoppedTime = 0;
   private brakeTag: string | null = null;
   public incidentCauses: Record<string, number> = {};
+  public overspeedS = 0; // time spent above limit+3 while moving
+  public topOverKmh = 0; // worst overspeed vs current limit
   private consecFails = 0;
   private errorNotified = false;
   private decisionEveryMs: number;
@@ -369,12 +372,14 @@ export class AutopilotGame {
     const s = candidates[Math.floor(Math.random() * candidates.length)] + (Math.random() * 14 - 4);
     const dir = Math.random() < 0.5 ? 1 : -1;
     const isDog = Math.random() < 0.22;
+    // cross from sidewalk to sidewalk, whatever the road width here
+    const walk = roadHalfAt(this.steps, s) + 1.1;
     this.crossings.push({
       id: uid++,
       s,
-      lateral: -dir * 7,
-      from: -dir * 7,
-      to: dir * 7,
+      lateral: -dir * walk,
+      from: -dir * walk,
+      to: dir * walk,
       speed: isDog ? 2.6 + Math.random() : 1.1 + Math.random() * 0.5,
       kind: isDog ? "perro" : "persona",
       done: false,
@@ -869,7 +874,7 @@ export class AutopilotGame {
       this.speedKmh = Math.max(0, this.speedKmh - EMERGENCY_BRAKE * dt);
       this.brakeTag = "emergency";
     } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
-      const target = Math.min(this.cruiseTargetKmh, limit + 10);
+      const target = Math.min(this.cruiseTargetKmh, limit);
       const safeGap = (this.speedKmh / 3.6) * 2 + 6;
       if (veh && gapM < safeGap) {
         this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
@@ -899,7 +904,8 @@ export class AutopilotGame {
               this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.7 * dt);
             }
           } else {
-            this.speedKmh = Math.min(Math.min(limit + 8, MAX_SPEED), this.speedKmh + ACCEL * dt);
+            // strict limit compliance: never use the road above its limit
+            this.speedKmh = Math.min(Math.max(limit, 20), MAX_SPEED, this.speedKmh + ACCEL * dt);
           }
           break;
         }
@@ -942,14 +948,44 @@ export class AutopilotGame {
               break;
             }
           }
-          // hold speed instead of sawtooth coasting: only ease off when
-          // clearly above the limit (Jev says "maintain", not "slow down")
-          if (this.speedKmh > limit + 3) {
-            this.speedKmh = Math.max(0, this.speedKmh - DRAG * 1.5 * dt);
+          // hold speed instead of sawtooth coasting: bleed only when a hair
+          // above the limit (Jev says "maintain", not "slow down")
+          if (this.speedKmh > limit + 0.5) {
+            this.speedKmh = Math.max(limit, this.speedKmh - DRAG * 1.5 * dt);
           }
           break;
         }
       }
+    }
+    // proactive limit compliance: if a LOWER limit starts within ~170 m,
+    // shed speed with a comfortable decel so we enter the zone at the limit
+    // (never blast through a 30 sign at the previous road's speed)
+    if (!this.emergency && this.accelCmd !== "brake") {
+      let zoneS = Infinity;
+      let zoneLim = Infinity;
+      for (const st of this.steps) {
+        if (st.s <= this.s + 3) continue;
+        if (st.s > this.s + 170) break;
+        const l = limitForStep(st, st.index);
+        if (l < zoneLim) {
+          zoneLim = l;
+          zoneS = st.s;
+        }
+      }
+      if (zoneLim < this.speedKmh - 1) {
+        const dist = Math.max(zoneS - this.s, 6);
+        const vMs = this.speedKmh / 3.6;
+        const limMs = zoneLim / 3.6;
+        const needMs2 = Math.max(0, (vMs * vMs - limMs * limMs) / (2 * dist));
+        const decel = Math.min(BRAKE * 0.55, Math.max(1.2, needMs2 * 3.6));
+        this.speedKmh = Math.max(zoneLim, this.speedKmh - decel * dt);
+        this.brakeTag = "limit-ahead";
+      }
+    }
+    // telemetry: any real overspeed time (limit+3 while moving)
+    if (this.speedKmh > 5 && this.speedKmh > limit + 3) {
+      this.overspeedS += dt;
+      this.topOverKmh = Math.max(this.topOverKmh, this.speedKmh - limit);
     }
     // ── REFLEX LAYER (AEB): safety is not negotiated with the model ──
     // Jev answers every ~1 s; a pedestrian stepping in between decisions must

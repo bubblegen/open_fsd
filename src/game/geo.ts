@@ -165,6 +165,44 @@ export function stepsWithS(poly: Polyline, proj: Projection, steps: RouteStep[])
   });
 }
 
+export type StepWithS = RouteStep & { s: number; index: number };
+
+/** half-width of the paved road (m) for a step, from its limit + class.
+ *  30-zone narrow street 6.6 m … motorway 14 m so the Tesla (1.85 m wide)
+ *  always sits in a believable lane with curb margin. */
+export function roadHalfWidthForStep(st: RouteStep, index: number): number {
+  const limit = limitForStep(st, index);
+  const t = `${st.name ?? ""} ${(st as { ref?: string }).ref ?? ""}`.toLowerCase();
+  if (limit >= 100) return 7.0; // motorway carriageway 14 m
+  if (limit >= 80) return 6.2; // arterial / nacional 12.4 m
+  if (/paseo|avenida|avda|av\.|boulevard|bulevar|diagonal|gran v[ií]a/.test(t)) return 5.4; // avenue ~10.8 m
+  if (limit >= 50) return 4.2; // urban street 8.4 m
+  if (limit >= 40) return 3.7; // 7.4 m
+  return 3.3; // narrow 30-zone street 6.6 m
+}
+
+/** smoothed road half-width at arc position s: blends over ~24 m into a
+ *  segment whose class changes so the curb never jumps at step boundaries */
+export function roadHalfAt(steps: StepWithS[], s: number): number {
+  if (steps.length === 0) return 4.2;
+  let cur = steps[0];
+  let next: StepWithS | null = null;
+  for (const st of steps) {
+    if (st.s <= s) cur = st;
+    else {
+      next = st;
+      break;
+    }
+  }
+  const curHalf = roadHalfWidthForStep(cur, cur.index);
+  if (!next) return curHalf;
+  const nextHalf = roadHalfWidthForStep(next, next.index);
+  if (nextHalf === curHalf) return curHalf;
+  const f = Math.min(1, Math.max(0, (s - (next.s - 24)) / 24));
+  const sm = f * f * (3 - 2 * f);
+  return curHalf + (nextHalf - curHalf) * sm;
+}
+
 /** legal-ish speed limit heuristic from the road name/ref + step length */
 export function limitForStep(st: RouteStep, index: number): number {
   const t = `${st.name} ${(st as { ref?: string }).ref ?? ""}`.toLowerCase();

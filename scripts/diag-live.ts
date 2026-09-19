@@ -123,6 +123,8 @@ async function main() {
   console.log("═ últimas 45 decisiones ═");
   log.slice(-45).forEach((l) => console.log(" ", l));
   console.log("incidentCauses:", (engine as unknown as { incidentCauses: Record<string, number> }).incidentCauses);
+  const tel = engine as unknown as { overspeedS: number; topOverKmh: number };
+  console.log(`overspeed: ${tel.overspeedS.toFixed(1)}s por encima de límite+3 (peor exceso +${tel.topOverKmh.toFixed(0)} km/h)`);
   console.log("result:", ended);
 }
 main().catch((e) => { console.error(e); process.exit(1); });

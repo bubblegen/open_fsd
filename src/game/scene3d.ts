@@ -7,10 +7,7 @@
  */
 import * as THREE from "three";
 import type { RenderState } from "./engine";
-import { limitForStep } from "./geo";
-
-const ROAD_HALF = 3.6;
-const SIDEWALK_OUT = 6.0;
+import { limitForStep, roadHalfAt } from "./geo";
 
 /* deterministic pseudo-random from a seed */
 function hash(n: number): number {
@@ -108,6 +105,7 @@ export class Scene3D {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera: THREE.PerspectiveCamera;
+  private sun: THREE.DirectionalLight;
   private clock = new THREE.Clock();
   private resizeObs: ResizeObserver;
   private built = false;
@@ -143,6 +141,9 @@ export class Scene3D {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.25;
+    // soft shadows: the car, buildings and poles cast onto the road
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.camera = new THREE.PerspectiveCamera(60, 16 / 9, 0.5, 900);
     this.scene.background = new THREE.Color(0x1f1a2e);
@@ -151,9 +152,17 @@ export class Scene3D {
     // golden-hour dusk: warm low sun + cool sky fill
     const hemi = new THREE.HemisphereLight(0x8fa3c8, 0x4a3f30, 1.5);
     this.scene.add(hemi);
-    const sun = new THREE.DirectionalLight(0xffbe78, 2.6);
-    sun.position.set(-120, 90, -80);
-    this.scene.add(sun);
+    this.sun = new THREE.DirectionalLight(0xffbe78, 2.6);
+    this.sun.position.set(-120, 90, -80);
+    this.sun.castShadow = true;
+    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.camera.near = 10;
+    this.sun.shadow.camera.far = 420;
+    this.sun.shadow.bias = -0.0004;
+    const sc = this.sun.shadow.camera;
+    sc.left = -130; sc.right = 130; sc.top = 130; sc.bottom = -130;
+    this.scene.add(this.sun);
+    this.scene.add(this.sun.target);
     this.scene.add(new THREE.AmbientLight(0x3a3f52, 0.9));
 
     // dusk sky dome + stars
@@ -212,6 +221,7 @@ export class Scene3D {
     const groundMat = new THREE.MeshLambertMaterial({ color: 0x373c45 });
     this.ground = new THREE.Mesh(groundGeo, groundMat);
     this.ground.rotation.x = -Math.PI / 2;
+    this.ground.receiveShadow = true;
     this.world.add(this.ground);
 
     this.buildRoad(rs);
@@ -220,9 +230,16 @@ export class Scene3D {
     this.buildStreetlights(rs);
     this.buildTrees(rs);
     this.buildGuardrails(rs);
+    this.buildLimitSigns(rs);
+    this.buildTrafficLights(rs);
+    this.buildParkedCars(rs);
     this.buildChevron();
     this.buildBeacon(rs);
     this.tesla = this.buildTesla();
+    this.tesla.group.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh && !(m.material as THREE.Material).transparent) m.castShadow = true;
+    });
 
     const carPos = this.toWorld(rs.car.x, rs.car.y);
     this.camPos.copy(carPos).add(new THREE.Vector3(0, 8, -12));
@@ -244,8 +261,8 @@ export class Scene3D {
 
   private stripGeometry(
     pts: { x: number; y: number; a: number; s?: number }[],
-    offA: number,
-    offB: number,
+    offA: number | ((p: { x: number; y: number; a: number; s?: number }) => number),
+    offB: number | ((p: { x: number; y: number; a: number; s?: number }) => number),
     y: number,
     vScale = 0,
   ): THREE.BufferGeometry {
@@ -254,8 +271,10 @@ export class Scene3D {
     for (const p of pts) {
       const nx = Math.cos(p.a + Math.PI / 2);
       const nz = Math.sin(p.a + Math.PI / 2);
-      pos.push(p.x + nx * offA, y, p.y + nz * offA);
-      pos.push(p.x + nx * offB, y, p.y + nz * offB);
+      const a = typeof offA === "function" ? offA(p) : offA;
+      const b = typeof offB === "function" ? offB(p) : offB;
+      pos.push(p.x + nx * a, y, p.y + nz * a);
+      pos.push(p.x + nx * b, y, p.y + nz * b);
       if (vScale > 0) {
         const v = (p.s ?? 0) / vScale;
         uv.push(0, v, 1, v);
@@ -277,46 +296,59 @@ export class Scene3D {
   private buildRoad(rs: RenderState) {
     const long = rs.poly.total > 25000;
     const pts = this.samplePath(rs, long ? 8 : 3);
+    const half = (p: { s?: number }) => roadHalfAt(rs.steps, p.s ?? 0);
     const add = (geo: THREE.BufferGeometry, color: number, opts: Partial<THREE.MeshLambertMaterialParameters> = {}) => {
       const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color, ...opts }));
       this.world.add(mesh);
       return mesh;
     };
-    // sidewalks then road (road slightly higher to avoid z-fighting)
-    add(this.stripGeometry(pts, ROAD_HALF, SIDEWALK_OUT, 0.012), 0x5c616b);
-    add(this.stripGeometry(pts, -SIDEWALK_OUT, -ROAD_HALF, 0.012), 0x5c616b);
+    // sidewalks then road — widths follow the road class (narrow 30-zone
+    // street 6.6 m … motorway 14 m), blended at step boundaries
+    add(this.stripGeometry(pts, half, (p) => half(p) + 2.4, 0.012), 0x5c616b);
+    add(this.stripGeometry(pts, (p) => -half(p) - 2.4, (p) => -half(p), 0.012), 0x5c616b);
     // asphalt with aggregate noise, repeated every ~14 m
     const asphalt = asphaltTexture();
     const roadMesh = new THREE.Mesh(
-      this.stripGeometry(pts, -ROAD_HALF, ROAD_HALF, 0.028, 14),
+      this.stripGeometry(pts, (p) => -half(p), half, 0.028, 14),
       new THREE.MeshLambertMaterial({ map: asphalt, color: 0xe2e6ec }),
     );
+    roadMesh.receiveShadow = true;
     this.world.add(roadMesh);
 
     // bright curb faces + edge lines
-    add(this.stripGeometry(pts, ROAD_HALF + 0.02, ROAD_HALF + 0.14, 0.042), 0x878d98);
-    add(this.stripGeometry(pts, -ROAD_HALF - 0.14, -ROAD_HALF - 0.02, 0.042), 0x878d98);
-    add(this.stripGeometry(pts, ROAD_HALF - 0.22, ROAD_HALF - 0.06, 0.042), 0xdfe4ec);
-    add(this.stripGeometry(pts, -ROAD_HALF + 0.06, -ROAD_HALF + 0.22, 0.042), 0xdfe4ec);
+    add(this.stripGeometry(pts, (p) => half(p) + 0.02, (p) => half(p) + 0.14, 0.042), 0x878d98);
+    add(this.stripGeometry(pts, (p) => -half(p) - 0.14, (p) => -half(p) - 0.02, 0.042), 0x878d98);
+    add(this.stripGeometry(pts, (p) => half(p) - 0.22, (p) => half(p) - 0.06, 0.042), 0xdfe4ec);
+    add(this.stripGeometry(pts, (p) => -half(p) + 0.06, (p) => -half(p) + 0.22, 0.042), 0xdfe4ec);
 
-    // center dashes
+    // lane markings: narrow two-way roads get a single dashed centre line;
+    // wide avenues/motorways get dashed lane lines at ±half/2
     const dashPos: number[] = [];
     const dashIdx: number[] = [];
     let di = 0;
-    for (let s = 4; s < rs.poly.total - 4; s += long ? 12 : 7.5) {
+    const pushDash = (s: number, off: number) => {
       const p = rs.poly.at(s);
       const q = rs.poly.at(s + 3);
       const nx = Math.cos(p.angle + Math.PI / 2);
       const nz = Math.sin(p.angle + Math.PI / 2);
       const w = 0.09;
       dashPos.push(
-        p.x + nx * w, 0.045, p.y + nz * w,
-        p.x - nx * w, 0.045, p.y - nz * w,
-        q.x + nx * w, 0.045, q.y + nz * w,
-        q.x - nx * w, 0.045, q.y - nz * w,
+        p.x + nx * (off + w), 0.045, p.y + nz * (off + w),
+        p.x + nx * (off - w), 0.045, p.y + nz * (off - w),
+        q.x + nx * (off + w), 0.045, q.y + nz * (off + w),
+        q.x + nx * (off - w), 0.045, q.y + nz * (off - w),
       );
       dashIdx.push(di, di + 1, di + 2, di + 1, di + 3, di + 2);
       di += 4;
+    };
+    for (let s = 4; s < rs.poly.total - 4; s += long ? 12 : 7.5) {
+      const h = roadHalfAt(rs.steps, s);
+      if (h >= 4.8) {
+        pushDash(s, -h / 2);
+        pushDash(s, h / 2);
+      } else {
+        pushDash(s, 0);
+      }
     }
     const dashGeo = new THREE.BufferGeometry();
     dashGeo.setAttribute("position", new THREE.Float32BufferAttribute(dashPos, 3));
@@ -333,11 +365,13 @@ export class Scene3D {
       // zebra stripes (explicit quads aligned to the road frame)
       const fx = Math.cos(p.angle);
       const fz = Math.sin(p.angle);
-      for (let k = -3; k <= 3; k++) {
+      const hwRoad = roadHalfAt(rs.steps, s);
+      const kMax = Math.max(2, Math.floor((hwRoad - 0.6) / 0.98));
+      for (let k = -kMax; k <= kMax; k++) {
         const cx = p.x + nx * k * 0.98;
         const cz = p.y + nz * k * 0.98;
         const hw = 0.28; // half width along travel dir
-        const hl = ROAD_HALF - 0.5; // half length across road
+        const hl = hwRoad - 0.5; // half length across road
         const corners = [
           [cx - fx * hw - nx * hl, cz - fz * hw - nz * hl],
           [cx + fx * hw - nx * hl, cz + fz * hw - nz * hl],
@@ -363,8 +397,8 @@ export class Scene3D {
         this.world.add(m);
       }
       // crossing street stub (explicit quad along the road normal)
-      const hl = 23;
-      const hw = 3.7;
+      const hl = hwRoad + 19;
+      const hw = 4.2;
       const sg = new THREE.BufferGeometry();
       sg.setAttribute(
         "position",
@@ -438,7 +472,8 @@ export class Scene3D {
     let n = 0;
     for (let s = 18; s < rs.poly.total - 10; s += 15, n++) {
       if (nearMan(s)) continue;
-      const p = rs.poly.at(s + hash(n) * 6);
+      const ss = s + hash(n) * 6;
+      const p = rs.poly.at(ss);
       for (const side of [-1, 1]) {
         const h1 = hash(n * 3.7 + side * 13.1);
         const h2 = hash(n * 7.3 + side * 29.7);
@@ -448,7 +483,7 @@ export class Scene3D {
         const width = 9 + h2 * 9;
         const height = 7 + h1 * h1 * 34 + h2 * 8;
         const setback = 6.5 + h3 * 5;
-        const off = side * (SIDEWALK_OUT + setback + depth / 2);
+        const off = side * (roadHalfAt(rs.steps, ss) + 2.7 + setback + depth / 2);
         const nx = Math.cos(p.angle + Math.PI / 2);
         const nz = Math.sin(p.angle + Math.PI / 2);
         const m = new THREE.Matrix4();
@@ -481,6 +516,8 @@ export class Scene3D {
       inst.setColorAt(i, new THREE.Color(c.r * 0.85, c.g * 0.8, c.b * 0.78));
     });
     inst.instanceMatrix.needsUpdate = true;
+    inst.castShadow = true;
+    inst.receiveShadow = true;
     if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
     this.world.add(inst);
   }
@@ -498,7 +535,7 @@ export class Scene3D {
       const side = count % 2 === 0 ? 1 : -1;
       const nx = Math.cos(p.angle + Math.PI / 2);
       const nz = Math.sin(p.angle + Math.PI / 2);
-      positions.push({ x: p.x + nx * side * (SIDEWALK_OUT + 0.4), z: p.y + nz * side * (SIDEWALK_OUT + 0.4), side });
+      positions.push({ x: p.x + nx * side * (roadHalfAt(rs.steps, s) + 0.45), z: p.y + nz * side * (roadHalfAt(rs.steps, s) + 0.45), side });
       count++;
     }
     const poles = new THREE.InstancedMesh(poleGeo, poleMat, positions.length);
@@ -507,7 +544,16 @@ export class Scene3D {
       poles.setMatrixAt(i, new THREE.Matrix4().makeTranslation(p.x, 2.7, p.z));
       heads.setMatrixAt(i, new THREE.Matrix4().makeTranslation(p.x, 5.4, p.z));
     });
+    poles.castShadow = true;
     this.world.add(poles, heads);
+    const poolGeo = new THREE.CircleGeometry(3.4, 20);
+    const poolMat = new THREE.MeshBasicMaterial({
+      color: 0xffc98a,
+      transparent: true,
+      opacity: 0.10,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
     for (const p of positions) {
       const spr = new THREE.Sprite(
         new THREE.SpriteMaterial({ map: texWarm, color: 0xffd9a0, transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false }),
@@ -515,6 +561,11 @@ export class Scene3D {
       spr.position.set(p.x, 5.4, p.z);
       spr.scale.set(4.5, 4.5, 1);
       this.world.add(spr);
+      // warm pool of light on the tarmac under each lamp
+      const pool = new THREE.Mesh(poolGeo, poolMat);
+      pool.rotation.x = -Math.PI / 2;
+      pool.position.set(p.x - p.side * 1.6, 0.033, p.z);
+      this.world.add(pool);
     }
   }
 
@@ -544,7 +595,7 @@ export class Scene3D {
       const p = rs.poly.at(ss);
       const nx = Math.cos(p.angle + Math.PI / 2);
       const nz = Math.sin(p.angle + Math.PI / 2);
-      const off = side * (SIDEWALK_OUT + 2.6 + hash(n * 3.3) * 2.6);
+      const off = side * (roadHalfAt(rs.steps, ss) + 2.2 + hash(n * 3.3) * 2.3);
       const x = p.x + nx * off;
       const z = p.y + nz * off;
       const scale = 0.95 + hash(n * 7.7) * 0.7;
@@ -589,7 +640,7 @@ export class Scene3D {
       const rot = new THREE.Matrix4().makeRotationY(-p.angle);
       const scale = new THREE.Matrix4().makeScale(1, 1, 1.02);
       for (const side of [-1, 1]) {
-        const off = side * (ROAD_HALF + 0.85);
+        const off = side * (roadHalfAt(rs.steps, s + 5.5) + 0.85);
         const m = new THREE.Matrix4()
           .makeTranslation(p.x + nx * off, 0.55, p.y + nz * off)
           .multiply(rot)
@@ -604,6 +655,130 @@ export class Scene3D {
       const inst = new THREE.InstancedMesh(geo, mat, mats.length);
       mats.forEach((m, i) => inst.setMatrixAt(i, m));
       this.world.add(inst);
+    }
+  }
+
+  /* ── roadside furniture ─────────────────────────────────────── */
+
+  private signTexCache = new Map<number, THREE.CanvasTexture>();
+  private limitSignTex(limit: number): THREE.CanvasTexture {
+    const cached = this.signTexCache.get(limit);
+    if (cached) return cached;
+    const c = document.createElement("canvas");
+    c.width = c.height = 128;
+    const g = c.getContext("2d")!;
+    g.fillStyle = "#f4f6f8";
+    g.beginPath();
+    g.arc(64, 64, 60, 0, Math.PI * 2);
+    g.fill();
+    g.strokeStyle = "#d2202f";
+    g.lineWidth = 14;
+    g.beginPath();
+    g.arc(64, 64, 52, 0, Math.PI * 2);
+    g.stroke();
+    g.fillStyle = "#15181d";
+    g.font = "bold 52px Arial, sans-serif";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText(String(limit), 64, 66);
+    const t = new THREE.CanvasTexture(c);
+    this.signTexCache.set(limit, t);
+    return t;
+  }
+
+  /** speed-limit signs at each step boundary, on the right verge facing us */
+  private buildLimitSigns(rs: RenderState) {
+    const poleGeo = new THREE.CylinderGeometry(0.035, 0.045, 2.5, 6);
+    const poleMat = new THREE.MeshLambertMaterial({ color: 0x8a929c });
+    const discGeo = new THREE.CircleGeometry(0.42, 24);
+    for (const st of rs.steps) {
+      if (st.s < 30 || st.s > rs.poly.total - 20) continue;
+      const s = st.s - 5; // just before the new limit starts
+      const p = rs.poly.at(s);
+      const side = 1;
+      const nx = Math.cos(p.angle + Math.PI / 2);
+      const nz = Math.sin(p.angle + Math.PI / 2);
+      const off = roadHalfAt(rs.steps, s) + 0.55;
+      const x = p.x + nx * side * off;
+      const z = p.y + nz * side * off;
+      const pole = new THREE.Mesh(poleGeo, poleMat);
+      pole.position.set(x, 1.25, z);
+      pole.castShadow = true;
+      this.world.add(pole);
+      const disc = new THREE.Mesh(
+        discGeo,
+        new THREE.MeshBasicMaterial({ map: this.limitSignTex(limitForStep(st, st.index)), side: THREE.DoubleSide }),
+      );
+      disc.position.set(x, 2.45, z);
+      disc.rotation.y = Math.PI / 2 - p.angle; // face the approaching driver
+      this.world.add(disc);
+    }
+  }
+
+  private trafficLights: { r: THREE.Mesh; a: THREE.Mesh; g: THREE.Mesh; phase: number }[] = [];
+
+  /** traffic lights at turn maneuvers (slow decorative cycle, GTA-style) */
+  private buildTrafficLights(rs: RenderState) {
+    const manS = stepsToS(rs);
+    const poleGeo = new THREE.CylinderGeometry(0.09, 0.11, 3.4, 6);
+    const poleMat = new THREE.MeshLambertMaterial({ color: 0x23282e });
+    const headGeo = new THREE.BoxGeometry(0.34, 0.95, 0.28);
+    const headMat = new THREE.MeshLambertMaterial({ color: 0x15181c });
+    const lampGeo = new THREE.CircleGeometry(0.095, 14);
+    for (const s of manS) {
+      if (s < 60 || s > rs.poly.total - 40) continue;
+      const p = rs.poly.at(s - 9);
+      const nx = Math.cos(p.angle + Math.PI / 2);
+      const nz = Math.sin(p.angle + Math.PI / 2);
+      const off = roadHalfAt(rs.steps, s - 9) + 0.5;
+      const x = p.x + nx * off;
+      const z = p.y + nz * off;
+      const pole = new THREE.Mesh(poleGeo, poleMat);
+      pole.position.set(x, 1.7, z);
+      pole.castShadow = true;
+      this.world.add(pole);
+      const head = new THREE.Mesh(headGeo, headMat);
+      head.position.set(x, 3.6, z);
+      head.rotation.y = Math.PI / 2 - p.angle;
+      this.world.add(head);
+      const mkLamp = (dy: number) => {
+        const m = new THREE.Mesh(lampGeo, new THREE.MeshBasicMaterial({ color: 0x20262c }));
+        m.position.set(x - nx * 0.15, 3.6 + dy, z - nz * 0.15);
+        m.rotation.y = Math.PI / 2 - p.angle;
+        this.world.add(m);
+        return m;
+      };
+      this.trafficLights.push({
+        r: mkLamp(0.28),
+        a: mkLamp(0),
+        g: mkLamp(-0.28),
+        phase: hash(s) * 3,
+      });
+    }
+  }
+
+  /** parked cars hugging the right curb on calm urban stretches */
+  private buildParkedCars(rs: RenderState) {
+    const manS = stepsToS(rs);
+    const nearMan = (s: number) => manS.some((m) => Math.abs(m - s) < 26);
+    let n = 0;
+    for (let s = 40; s < rs.poly.total - 30; s += 34, n++) {
+      if (nearMan(s) || this.limitAt(rs, s) >= 80) continue;
+      if (hash(n * 11.3) < 0.45) continue; // plenty of gaps
+      const p = rs.poly.at(s);
+      const h = roadHalfAt(rs.steps, s);
+      if (h < 3.6) continue; // no parking on the narrowest lanes
+      const nx = Math.cos(p.angle + Math.PI / 2);
+      const nz = Math.sin(p.angle + Math.PI / 2);
+      const off = h - 1.05;
+      const color = ["#6b7280", "#8e99a8", "#4b5563", "#7a8699", "#5c6470"][Math.floor(hash(n * 3.7) * 5)];
+      const v = this.makeVehicle("car", color);
+      v.group.position.set(p.x + nx * off, 0, p.y + nz * off);
+      v.group.rotation.y = Math.PI / 2 - p.angle;
+      v.group.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) o.castShadow = true;
+      });
+      this.world.add(v.group);
     }
   }
 
@@ -911,6 +1086,9 @@ export class Scene3D {
     if (this.ground) {
       this.ground.position.set(Math.round(carP.x / 60) * 60, 0, Math.round(carP.y / 60) * 60);
     }
+    // the shadow frustum follows the car too
+    this.sun.position.set(carP.x - 120, 95, carP.y - 80);
+    this.sun.target.position.set(carP.x, 0, carP.y);
 
     // Tesla
     const tes = this.tesla;
@@ -922,18 +1100,25 @@ export class Scene3D {
     yawD = Math.atan2(Math.sin(yawD), Math.cos(yawD));
     this.carYaw += yawD * (1 - Math.exp(-dt * 7));
     tes.group.rotation.y = this.carYaw;
-    // wheels roll with ground speed; front pair steers into maneuvers
+    // wheels roll with ground speed
     this.wheelSpin = (this.wheelSpin + (rs.speedKmh / 3.6) * dt / 0.34) % (Math.PI * 2);
-    let steer = 0;
-    const manSoon = rs.nextManeuver;
-    if (manSoon && manSoon.distanceM < 26 && manSoon.distanceM > 2) {
-      if (manSoon.modifier === "left" || manSoon.modifier === "slight left") steer = 0.30;
-      else if (manSoon.modifier === "right" || manSoon.modifier === "slight right") steer = -0.30;
-    }
-    this.steerYaw += (steer - this.steerYaw) * (1 - Math.exp(-dt * 5));
+    // steering anticipates the path curvature ahead instead of snapping on
+    // when a maneuver is near: wheels enter the curve before the body and
+    // return to centre smoothly on straights
+    const a0 = rs.poly.at(rs.s + 2).angle;
+    const a1 = rs.poly.at(rs.s + 16).angle;
+    let dAhead = a1 - a0;
+    dAhead = Math.atan2(Math.sin(dAhead), Math.cos(dAhead));
+    const steerTarget = Math.max(-0.42, Math.min(0.42, -dAhead * 1.35));
+    this.steerYaw += (steerTarget - this.steerYaw) * (1 - Math.exp(-dt * 4.5));
     tes.wheels.forEach((w, i) => {
       w.rotation.set(this.wheelSpin, i % 2 === 0 ? this.steerYaw : this.steerYaw, Math.PI / 2);
     });
+    // subtle body roll in corners + nose dip under braking
+    const roll = -this.steerYaw * Math.min(rs.speedKmh / 70, 1) * 0.055;
+    const pitch = rs.accelCmd === "accelerate" ? -0.008 : rs.accelCmd === "brake" ? 0.015 : 0;
+    tes.group.rotation.z += (roll - tes.group.rotation.z) * (1 - Math.exp(-dt * 6));
+    tes.group.rotation.x += (pitch - tes.group.rotation.x) * (1 - Math.exp(-dt * 3));
     const braking = rs.accelCmd === "brake" || (tes.group.userData.prevS !== undefined && rs.s < tes.group.userData.prevS);
     (tes.brake.material as THREE.MeshBasicMaterial).color.set(braking ? 0xff2d2d : 0x5a0f12);
     tes.group.userData.prevS = rs.s;
@@ -952,6 +1137,14 @@ export class Scene3D {
     }
     tes.signals.l.material.opacity = want === "l" && blink ? 0.95 : 0;
     tes.signals.r.material.opacity = want === "r" && blink ? 0.95 : 0;
+
+    // traffic lights cycle slowly (decorative, GTA-style)
+    for (const tl of this.trafficLights) {
+      const cyc = Math.floor(rs.elapsed * 0.12 + tl.phase) % 3;
+      (tl.r.material as THREE.MeshBasicMaterial).color.set(cyc === 2 ? 0xff3b30 : 0x2a1214);
+      (tl.a.material as THREE.MeshBasicMaterial).color.set(cyc === 1 ? 0xffb02e : 0x241d10);
+      (tl.g.material as THREE.MeshBasicMaterial).color.set(cyc === 0 ? 0x2eff6e : 0x0f2417);
+    }
 
     // traffic pool
     const seen = new Set<number>();

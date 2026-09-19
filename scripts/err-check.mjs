@@ -1,0 +1,13 @@
+import { chromium } from '/home/kimi/.npm-global/lib/node_modules/playwright/index.mjs';
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
+page.on('console', (m) => { if (m.type() === 'error') console.log('CONSOLE ERROR:', m.text().slice(0, 500)); });
+page.on('pageerror', (e) => console.log('PAGE ERROR:', (e.stack ?? String(e)).slice(0, 1200)));
+await page.goto('http://localhost:3000/', { waitUntil: 'networkidle' });
+await page.waitForTimeout(1200);
+await page.getByRole('button', { name: 'Madrid: Sol → Chamartín' }).click();
+await page.waitForTimeout(800);
+await page.getByRole('button', { name: 'Iniciar simulación' }).click();
+await page.waitForTimeout(12000);
+await browser.close();
+console.log('done');
