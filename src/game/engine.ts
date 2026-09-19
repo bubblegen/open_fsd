@@ -163,6 +163,8 @@ export class AutopilotGame {
   private lastDecisionSim = -999;
   private decisionSentWall = 0;
   private stoppedTime = 0;
+  private consecFails = 0;
+  private errorNotified = false;
   private decisionEveryMs: number;
   private stuckBehindS = 0;
   private pendingDecision = false;
@@ -553,12 +555,7 @@ export class AutopilotGame {
     if (this.pendingDecision) {
       if (now - this.decisionSentWall < 12000) return;
       this.pendingDecision = false;
-      this.status = "error";
-      this.accelCmd = "brake";
-      this.cb.onError("Jev no respondió a tiempo; reintentando…");
-      setTimeout(() => {
-        if (this.status === "error") this.status = "running";
-      }, 1500);
+      this.noteDecisionFailure("Jev no respondió a tiempo; reintentando…");
     }
     // pace decisions in SIMULATION time so throttled tabs get the same
     // behaviour as visible ones (wall-clock pacing made commands alternate
@@ -587,23 +584,39 @@ export class AutopilotGame {
       .then((res) => this.handleJevResponse(res, state))
       .catch((err: unknown) => {
         this.pendingDecision = false;
-        this.status = "error";
-        this.accelCmd = "brake";
+        this.noteDecisionFailure(err instanceof Error ? err.message : "Error al consultar a Jev");
         if (this.currentDecision) {
           this.currentDecision.pending = false;
           this.cb.onDecision(this.currentDecision);
         }
-        this.cb.onError(err instanceof Error ? err.message : "Error al consultar a Jev");
-        setTimeout(() => {
-          if (this.status === "error") this.status = "running";
-        }, 2500);
       });
+  }
+
+  /**
+   * Transient API failures must never kill the session: the first failures
+   * brake gently (safe stop), but if the API keeps failing the car creeps in
+   * "maintain" so the trip degrades gracefully instead of freezing on the
+   * road. Recovers automatically on the next successful decision.
+   */
+  private noteDecisionFailure(msg: string) {
+    this.consecFails++;
+    this.status = "error";
+    this.accelCmd = this.consecFails < 3 ? "brake" : "maintain";
+    if (!this.errorNotified) {
+      this.errorNotified = true;
+      this.cb.onError(msg);
+    }
+    setTimeout(() => {
+      if (this.status === "error") this.status = "running";
+    }, 1500);
   }
 
   private handleJevResponse(res: DecideResponse, state: PerceptionState) {
     this.pendingDecision = false;
     if (this.status !== "ended") this.status = "running";
     this.decisions++;
+    this.consecFails = 0;
+    this.errorNotified = false;
 
     const view: DecisionView = {
       tick: this.tick,
