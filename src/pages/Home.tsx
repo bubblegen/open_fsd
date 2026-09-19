@@ -440,8 +440,20 @@ function GameScreen({
       onTripEnd: handleTripEnd,
       onError: handleError,
       requestDecision: async (state) => {
-        const res = await decideRef.current({ state });
-        return res as unknown as DecideResponse;
+        // one transparent retry: most fetch failures on long trips are
+        // transient network blips, not real API outages
+        try {
+          const res = await decideRef.current({ state });
+          return res as unknown as DecideResponse;
+        } catch (first) {
+          await new Promise((r) => setTimeout(r, 1200));
+          try {
+            const res = await decideRef.current({ state });
+            return res as unknown as DecideResponse;
+          } catch (second) {
+            throw second ?? first;
+          }
+        }
       },
     });
     engineRef.current = engine;
@@ -549,7 +561,7 @@ function GameScreen({
               <CardContent className="p-3 relative">
                 <canvas ref={canvasRef} className="w-full block rounded-md bg-[#05070d]" />
                 {/* GPS radar ball, bottom-right (GTA style) */}
-                <div className="absolute bottom-3 right-3 rounded-full shadow-[0_0_30px_rgba(0,0,0,0.6)]">
+                <div className="absolute bottom-3 left-3 rounded-full shadow-[0_0_30px_rgba(0,0,0,0.6)] ring-1 ring-slate-700/60">
                   <canvas ref={radarRef} className="block rounded-full" />
                 </div>
                 {overlay && (
