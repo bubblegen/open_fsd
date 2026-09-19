@@ -2,9 +2,8 @@ import {
   mysqlTable,
   mysqlEnum,
   serial,
-  varchar,
-  text,
   timestamp,
+  int,
   // bigint,
 } from "drizzle-orm/mysql-core";
 
@@ -20,3 +19,17 @@ import {
 //
 // Note: FK columns referencing a serial() PK must use:
 //   bigint("columnName", { mode: "number", unsigned: true }).notNull()
+
+// A finished (or crashed) autonomous trip, persisted for the "recent trips" panel.
+export const trips = mysqlTable("trips", {
+  id: serial("id").primaryKey(),
+  mode: mysqlEnum("mode", ["autopilot", "human"]).notNull().default("autopilot"),
+  score: int("score").notNull(),
+  distanceM: int("distance_m").notNull(),
+  durationS: int("duration_s").notNull(),
+  decisions: int("decisions").notNull(),
+  incidents: int("incidents").notNull(),
+  destinationsReached: int("destinations_reached").notNull(),
+  crashed: mysqlEnum("crashed", ["yes", "no"]).notNull().default("no"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
