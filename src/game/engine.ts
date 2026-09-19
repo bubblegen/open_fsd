@@ -245,6 +245,8 @@ export class AutopilotGame {
         this.update(dt);
         if (this.status === "ended") break;
       }
+      // render once per tick — a render per sub-step melts the main thread
+      this.emitFrame();
     };
     this.timer = window.setInterval(tick, 250);
     const rafLoop = () => {
@@ -896,7 +898,11 @@ export class AutopilotGame {
     }
 
     this.maybeDecide(dt);
-    this.cb.onFrame(this.snapshot());
+  }
+
+  /** pushed once per loop tick (not per physics sub-step) */
+  private emitFrame() {
+    if (this.status !== "ended") this.cb.onFrame(this.snapshot());
   }
 
   private crashReason: string | null = null;

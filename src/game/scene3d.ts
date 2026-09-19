@@ -7,6 +7,7 @@
  */
 import * as THREE from "three";
 import type { RenderState } from "./engine";
+import { limitForStep } from "./geo";
 
 const ROAD_HALF = 3.6;
 const SIDEWALK_OUT = 6.0;
@@ -28,6 +29,69 @@ function glowTexture(color: string): THREE.CanvasTexture {
   g.fillStyle = grad;
   g.fillRect(0, 0, 64, 64);
   const t = new THREE.CanvasTexture(c);
+  return t;
+}
+
+/** night sky gradient: deep navy zenith → city-glow horizon (GTA-style) */
+function skyTexture(): THREE.CanvasTexture {
+  const c = document.createElement("canvas");
+  c.width = 4;
+  c.height = 512;
+  const g = c.getContext("2d")!;
+  const grad = g.createLinearGradient(0, 0, 0, 512);
+  grad.addColorStop(0.0, "#020409");
+  grad.addColorStop(0.45, "#071022");
+  grad.addColorStop(0.72, "#0e2240");
+  grad.addColorStop(0.88, "#27436b");
+  grad.addColorStop(1.0, "#7a5a3a");
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 4, 512);
+  const t = new THREE.CanvasTexture(c);
+  return t;
+}
+
+/** facade texture with lit windows for the procedural buildings */
+function windowsTexture(): THREE.CanvasTexture {
+  const c = document.createElement("canvas");
+  c.width = 96;
+  c.height = 192;
+  const g = c.getContext("2d")!;
+  g.fillStyle = "#07080c";
+  g.fillRect(0, 0, 96, 192);
+  const cols = 8;
+  const rows = 18;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      const r = hash(x * 17.3 + y * 91.7);
+      if (r < 0.3) {
+        const warm = hash(x * 3.1 + y * 7.7) < 0.55;
+        g.fillStyle = warm ? "rgba(255,190,105,0.9)" : "rgba(175,210,255,0.85)";
+      } else if (r < 0.38) {
+        g.fillStyle = "rgba(110,130,160,0.25)";
+      } else {
+        g.fillStyle = "rgba(14,19,28,0.92)";
+      }
+      g.fillRect(3 + x * 11.5, 5 + y * 10.4, 6, 4);
+    }
+  }
+  const t = new THREE.CanvasTexture(c);
+  return t;
+}
+
+/** subtle asphalt noise */
+function asphaltTexture(): THREE.CanvasTexture {
+  const c = document.createElement("canvas");
+  c.width = c.height = 256;
+  const g = c.getContext("2d")!;
+  g.fillStyle = "#3a3f47";
+  g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 5200; i++) {
+    const v = 40 + Math.floor(hash(i * 1.37) * 40);
+    g.fillStyle = `rgba(${v},${v + 3},${v + 8},${0.16 + hash(i * 2.9) * 0.2})`;
+    g.fillRect(hash(i * 3.7) * 256, hash(i * 7.1) * 256, 1.4, 1.4);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
   return t;
 }
 
@@ -86,6 +150,32 @@ export class Scene3D {
     this.scene.add(moon);
     this.scene.add(new THREE.AmbientLight(0x1c2430, 1.4));
 
+    // night sky dome + stars
+    const sky = new THREE.Mesh(
+      new THREE.SphereGeometry(860, 24, 16),
+      new THREE.MeshBasicMaterial({ map: skyTexture(), side: THREE.BackSide, fog: false, depthWrite: false }),
+    );
+    sky.rotation.y = 0.6;
+    this.scene.add(sky);
+    const starGeo = new THREE.BufferGeometry();
+    const starPos: number[] = [];
+    for (let i = 0; i < 420; i++) {
+      const az = hash(i * 3.3) * Math.PI * 2;
+      const el = Math.acos(hash(i * 7.9) * 0.85); // bias toward zenith
+      const r = 820;
+      starPos.push(
+        r * Math.sin(el) * Math.cos(az),
+        r * Math.cos(el) * 0.9 + 40,
+        r * Math.sin(el) * Math.sin(az),
+      );
+    }
+    starGeo.setAttribute("position", new THREE.Float32BufferAttribute(starPos, 3));
+    const stars = new THREE.Points(
+      starGeo,
+      new THREE.PointsMaterial({ color: 0xbdd0ff, size: 1.6, sizeAttenuation: false, fog: false, transparent: true, opacity: 0.75 }),
+    );
+    this.scene.add(stars);
+
     this.scene.add(this.world);
 
     this.resizeObs = new ResizeObserver(() => this.resize());
@@ -122,6 +212,8 @@ export class Scene3D {
     this.buildRouteLines(rs);
     this.buildBuildings(rs);
     this.buildStreetlights(rs);
+    this.buildTrees(rs);
+    this.buildGuardrails(rs);
     this.buildChevron();
     this.buildBeacon(rs);
     this.tesla = this.buildTesla();
@@ -145,17 +237,23 @@ export class Scene3D {
   }
 
   private stripGeometry(
-    pts: { x: number; y: number; a: number }[],
+    pts: { x: number; y: number; a: number; s?: number }[],
     offA: number,
     offB: number,
     y: number,
+    vScale = 0,
   ): THREE.BufferGeometry {
     const pos: number[] = [];
+    const uv: number[] = [];
     for (const p of pts) {
       const nx = Math.cos(p.a + Math.PI / 2);
       const nz = Math.sin(p.a + Math.PI / 2);
       pos.push(p.x + nx * offA, y, p.y + nz * offA);
       pos.push(p.x + nx * offB, y, p.y + nz * offB);
+      if (vScale > 0) {
+        const v = (p.s ?? 0) / vScale;
+        uv.push(0, v, 1, v);
+      }
     }
     const idx: number[] = [];
     for (let i = 0; i < pts.length - 1; i++) {
@@ -164,13 +262,15 @@ export class Scene3D {
     }
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    if (uv.length > 0) g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
     g.setIndex(idx);
     g.computeVertexNormals();
     return g;
   }
 
   private buildRoad(rs: RenderState) {
-    const pts = this.samplePath(rs, 3);
+    const long = rs.poly.total > 25000;
+    const pts = this.samplePath(rs, long ? 8 : 3);
     const add = (geo: THREE.BufferGeometry, color: number, opts: Partial<THREE.MeshLambertMaterialParameters> = {}) => {
       const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color, ...opts }));
       this.world.add(mesh);
@@ -179,7 +279,13 @@ export class Scene3D {
     // sidewalks then road (road slightly higher to avoid z-fighting)
     add(this.stripGeometry(pts, ROAD_HALF, SIDEWALK_OUT, 0.012), 0x343941);
     add(this.stripGeometry(pts, -SIDEWALK_OUT, -ROAD_HALF, 0.012), 0x343941);
-    add(this.stripGeometry(pts, -ROAD_HALF, ROAD_HALF, 0.028), 0x262b33);
+    // asphalt with subtle noise texture, repeated every ~14 m
+    const asphalt = asphaltTexture();
+    const roadMesh = new THREE.Mesh(
+      this.stripGeometry(pts, -ROAD_HALF, ROAD_HALF, 0.028, 14),
+      new THREE.MeshLambertMaterial({ map: asphalt, color: 0xb9bec6 }),
+    );
+    this.world.add(roadMesh);
 
     // edge lines
     add(this.stripGeometry(pts, ROAD_HALF - 0.2, ROAD_HALF - 0.05, 0.042), 0x6f7681);
@@ -189,7 +295,7 @@ export class Scene3D {
     const dashPos: number[] = [];
     const dashIdx: number[] = [];
     let di = 0;
-    for (let s = 4; s < rs.poly.total - 4; s += 7.5) {
+    for (let s = 4; s < rs.poly.total - 4; s += long ? 12 : 7.5) {
       const p = rs.poly.at(s);
       const q = rs.poly.at(s + 3);
       const nx = Math.cos(p.angle + Math.PI / 2);
@@ -349,34 +455,25 @@ export class Scene3D {
     }
 
     const geo = new THREE.BoxGeometry(1, 1, 1);
-    const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    // facades with lit windows: the emissive map makes windows glow at night
+    const facades = windowsTexture();
+    const mat = new THREE.MeshLambertMaterial({
+      color: 0xffffff,
+      map: facades,
+      emissive: 0xffffff,
+      emissiveMap: facades,
+      emissiveIntensity: 0.34,
+    });
     const inst = new THREE.InstancedMesh(geo, mat, mats.length);
     mats.forEach((m, i) => {
       inst.setMatrixAt(i, m);
-      inst.setColorAt(i, colors[i]);
+      // darken the facade a bit but keep window glow readable
+      const c = colors[i];
+      inst.setColorAt(i, new THREE.Color(c.r * 0.55, c.g * 0.55, c.b * 0.6));
     });
     inst.instanceMatrix.needsUpdate = true;
     if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
     this.world.add(inst);
-
-    // a few windows-lit buildings (emissive yellow-ish boxes)
-    const litCount = Math.min(60, Math.floor(mats.length / 8));
-    const lit = new THREE.InstancedMesh(
-      new THREE.BoxGeometry(1.02, 0.6, 1.02),
-      new THREE.MeshBasicMaterial({ color: 0x3a3524 }),
-      litCount,
-    );
-    for (let i = 0; i < litCount; i++) {
-      const src = mats[Math.floor(hash(i * 17.3) * mats.length)];
-      const m = new THREE.Matrix4().copy(src);
-      const pos = new THREE.Vector3(), rq = new THREE.Quaternion(), sc = new THREE.Vector3();
-      m.decompose(pos, rq, sc);
-      pos.y = sc.y * (0.35 + hash(i * 3.1) * 0.4);
-      sc.set(sc.x * 1.001, 0.35, sc.z * 1.001);
-      const mm = new THREE.Matrix4().compose(pos, rq, sc);
-      lit.setMatrixAt(i, mm);
-    }
-    this.world.add(lit);
   }
 
   private buildStreetlights(rs: RenderState) {
@@ -409,6 +506,95 @@ export class Scene3D {
       spr.position.set(p.x, 5.4, p.z);
       spr.scale.set(4.5, 4.5, 1);
       this.world.add(spr);
+    }
+  }
+
+  /** speed limit (km/h) at arc position s, from the route steps */
+  private limitAt(rs: RenderState, s: number): number {
+    let limit = 50;
+    for (const st of rs.steps) {
+      if (st.s <= s) limit = limitForStep(st, st.index);
+      else break;
+    }
+    return limit;
+  }
+
+  /** low-poly pines along urban sidewalks (GTA V roadside flavour) */
+  private buildTrees(rs: RenderState) {
+    const manS = stepsToS(rs);
+    const nearMan = (s: number) => manS.some((m) => Math.abs(m - s) < 22);
+    const trunkM: THREE.Matrix4[] = [];
+    const leafM: THREE.Matrix4[] = [];
+    let n = 0;
+    for (let s = 24; s < rs.poly.total - 20; s += 30, n++) {
+      const jitter = hash(n * 5.13) * 14;
+      const ss = s + jitter;
+      if (nearMan(ss) || this.limitAt(rs, ss) >= 80) continue;
+      if (hash(n * 9.7) < 0.25) continue; // gaps
+      const side = n % 2 === 0 ? 1 : -1;
+      const p = rs.poly.at(ss);
+      const nx = Math.cos(p.angle + Math.PI / 2);
+      const nz = Math.sin(p.angle + Math.PI / 2);
+      const off = side * (SIDEWALK_OUT + 2.4 + hash(n * 3.3) * 3.5);
+      const x = p.x + nx * off;
+      const z = p.y + nz * off;
+      const scale = 0.8 + hash(n * 7.7) * 0.7;
+      trunkM.push(
+        new THREE.Matrix4().makeTranslation(x, 0.8 * scale, z).multiply(
+          new THREE.Matrix4().makeScale(scale, scale, scale),
+        ),
+      );
+      leafM.push(
+        new THREE.Matrix4().makeTranslation(x, (1.6 + 1.9) * scale, z).multiply(
+          new THREE.Matrix4().makeScale(scale, scale * (0.9 + hash(n * 2.1) * 0.4), scale),
+        ),
+      );
+    }
+    if (trunkM.length === 0) return;
+    const trunks = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(0.14, 0.22, 1.6, 6),
+      new THREE.MeshLambertMaterial({ color: 0x41321f }),
+      trunkM.length,
+    );
+    const leaves = new THREE.InstancedMesh(
+      new THREE.ConeGeometry(1.5, 3.8, 7),
+      new THREE.MeshLambertMaterial({ color: 0x1d3a24 }),
+      leafM.length,
+    );
+    trunkM.forEach((m, i) => trunks.setMatrixAt(i, m));
+    leafM.forEach((m, i) => leaves.setMatrixAt(i, m));
+    this.world.add(trunks);
+    this.world.add(leaves);
+  }
+
+  /** metal guardrails on fast roads (motorway feel) */
+  private buildGuardrails(rs: RenderState) {
+    const matsL: THREE.Matrix4[] = [];
+    const matsR: THREE.Matrix4[] = [];
+    let n = 0;
+    for (let s = 10; s < rs.poly.total - 10; s += 11, n++) {
+      if (this.limitAt(rs, s) < 80) continue;
+      const p = rs.poly.at(s + 5.5);
+      const nx = Math.cos(p.angle + Math.PI / 2);
+      const nz = Math.sin(p.angle + Math.PI / 2);
+      const rot = new THREE.Matrix4().makeRotationY(-p.angle);
+      const scale = new THREE.Matrix4().makeScale(1, 1, 1.02);
+      for (const side of [-1, 1]) {
+        const off = side * (ROAD_HALF + 0.85);
+        const m = new THREE.Matrix4()
+          .makeTranslation(p.x + nx * off, 0.55, p.y + nz * off)
+          .multiply(rot)
+          .multiply(scale);
+        (side === 1 ? matsR : matsL).push(m);
+      }
+    }
+    if (matsL.length === 0) return;
+    const geo = new THREE.BoxGeometry(0.16, 0.5, 11.4);
+    const mat = new THREE.MeshLambertMaterial({ color: 0x99a3ae, emissive: 0x15181d });
+    for (const mats of [matsL, matsR]) {
+      const inst = new THREE.InstancedMesh(geo, mat, mats.length);
+      mats.forEach((m, i) => inst.setMatrixAt(i, m));
+      this.world.add(inst);
     }
   }
 
