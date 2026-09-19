@@ -32,6 +32,55 @@ export interface PathPoint {
   y: number;
 }
 
+/**
+ * Return a copy of `src` with sharp corners replaced by quadratic-bezier
+ * arcs, so the driven path and the painted trajectory curve smoothly through
+ * turns instead of snapping at every OSRM geometry vertex.
+ */
+export function roundedPolyline(src: Polyline, radius = 7): Polyline {
+  const P = src.pts;
+  if (P.length < 3) return src;
+  const out: PathPoint[] = [P[0]];
+  for (let i = 1; i < P.length - 1; i++) {
+    const a = P[i - 1];
+    const b = P[i];
+    const c = P[i + 1];
+    const abx = b.x - a.x;
+    const aby = b.y - a.y;
+    const bcx = c.x - b.x;
+    const bcy = c.y - b.y;
+    const lab = Math.hypot(abx, aby);
+    const lbc = Math.hypot(bcx, bcy);
+    if (lab < 0.5 || lbc < 0.5) continue; // degenerate, drop
+    const dot = (abx * bcx + aby * bcy) / (lab * lbc);
+    if (dot > 0.978) {
+      // nearly straight (<~12°): keep the vertex as-is
+      out.push(b);
+      continue;
+    }
+    const r = Math.min(radius, lab * 0.35, lbc * 0.35);
+    const u1x = abx / lab;
+    const u1y = aby / lab;
+    const u2x = bcx / lbc;
+    const u2y = bcy / lbc;
+    const p1 = { x: b.x - u1x * r, y: b.y - u1y * r };
+    const p2 = { x: b.x + u2x * r, y: b.y + u2y * r };
+    out.push(p1);
+    const STEPS = 6;
+    for (let k = 1; k <= STEPS; k++) {
+      const t = k / (STEPS + 1);
+      const mt = 1 - t;
+      out.push({
+        x: mt * mt * p1.x + 2 * mt * t * b.x + t * t * p2.x,
+        y: mt * mt * p1.y + 2 * mt * t * b.y + t * t * p2.y,
+      });
+    }
+    out.push(p2);
+  }
+  out.push(P[P.length - 1]);
+  return new Polyline(out);
+}
+
 /** Arc-length parameterized polyline with interpolation. */
 export class Polyline {
   pts: PathPoint[];
