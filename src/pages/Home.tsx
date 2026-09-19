@@ -402,6 +402,9 @@ function GameScreen({
   const handleTripEnd = useCallback(
     (result: TripResult) => {
       setOverlay(result);
+      // debuggability: headless checks read the final trip from here
+      (window as unknown as { __lastTrip?: TripResult }).__lastTrip = result;
+      if (result.crashed) console.error("[trip] CRASH:", result.reason);
       saveTrip.mutate(
         { ...result, mode },
         { onSettled: () => utils.trips.recent.invalidate() },
@@ -572,6 +575,9 @@ function GameScreen({
                           <AlertTriangle className="w-12 h-12 text-red-400 mx-auto" />
                           <h2 className="text-2xl font-bold text-red-400">Accidente</h2>
                           <p className="text-sm text-slate-300">El viaje ha terminado.</p>
+                          <p className="text-xs font-mono text-red-300/90 bg-red-950/50 border border-red-900/60 rounded px-3 py-1.5">
+                            {overlay.reason}
+                          </p>
                         </>
                       ) : (
                         <>

@@ -53,10 +53,13 @@ async function scenario(name: string, startSpeedKmh: number, stoppedAtM: number)
   const ctx: Ctx = { engine, car, minDs: Infinity, maxPassSpeed: 0, passed: false, waitedS: 0 };
   let prevWait = 0;
   let midPassLat = 0; // lateral separation recorded when longitudinally alongside
+  const signals = new Set<string>(); // indicator states observed during the flow
   for (let i = 0; i < 3600; i++) { // 180 sim-seconds max
     e.traffic = [car]; // only our victim; spawnTraffic re-adds nothing
+    e.crossings = []; // no random pedestrians: deterministic vehicle-only test
     car.speedMs = 0; car.baseSpeedMs = 0; // stays stopped
     engine.update(0.05);
+    if (e.overtakeSignal) signals.add(e.overtakeSignal);
     const ds = car.s - e.s;
     if (e.overtakeId === null && ds > -1 && ds < ctx.minDs) ctx.minDs = ds; // approach phase only
     if (e.overtakeId !== null) {
@@ -71,8 +74,8 @@ async function scenario(name: string, startSpeedKmh: number, stoppedAtM: number)
   const bumper = ctx.minDs - 4.6;
   console.log(`${name}: min ds(aprox)=${ctx.minDs.toFixed(2)}m (parachoques ${bumper.toFixed(2)}m) | ` +
     `espera=${ctx.waitedS.toFixed(1)}s | adelantó=${ctx.passed} | v_max_paso=${ctx.maxPassSpeed.toFixed(1)} km/h | ` +
-    `sep.lateral paso=${midPassLat.toFixed(2)}m | crash=${e.crashed}${e.crashed ? ` (${e.crashReason})` : ""}`);
-  return { ...ctx, midPassLat } as Ctx & { midPassLat: number };
+    `sep.lateral paso=${midPassLat.toFixed(2)}m | intermitentes=[${[...signals].join(",")}] | crash=${e.crashed}${e.crashed ? ` (${e.crashReason})` : ""}`);
+  return { ...ctx, midPassLat, signals } as Ctx & { midPassLat: number; signals: Set<string> };
 }
 
 async function main() {
@@ -86,7 +89,9 @@ async function main() {
     a.passed && b.passed && // eventually crept past
     a.maxPassSpeed <= 6.6 && b.maxPassSpeed <= 6.6 &&
     lat(a) >= 1.8 && lat(b) >= 1.8 && // real lateral separation while alongside
-    c.minDs >= 4.4; // motorway-speed stop also keeps bumper margin
+    c.minDs >= 4.4 && // motorway-speed stop also keeps bumper margin
+    a.signals.has("passing") && a.signals.has("returning") && // L to pass, R to rejoin
+    b.signals.has("passing") && b.signals.has("returning");
   console.log(ok ? "OK: cuerpos sólidos, espera + adelantamiento lento" : "FALLO");
   process.exit(ok ? 0 : 1);
 }

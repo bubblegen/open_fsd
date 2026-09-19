@@ -103,6 +103,8 @@ export interface Snapshot {
   distanceM: number;
   incidents: number;
   decisions: number;
+  decisionsFailed: number;
+  crashReason: string | null;
   autopilot: boolean;
   emergency: boolean;
 }
@@ -179,6 +181,8 @@ export class AutopilotGame {
   private overtakeId: number | null = null; // stopped car we are creeping past
   private blockedWaitS = 0; // time spent waiting behind a stopped car
   private teslaLat = LANE; // lateral offset (shifts toward centre to pass)
+  private overtakeSignal: "passing" | "returning" | null = null; // indicators
+  private overtakeReturnT = 0; // "returning" blink time left
   private consecFails = 0;
   private errorNotified = false;
   private decisionEveryMs: number;
@@ -212,6 +216,7 @@ export class AutopilotGame {
   private distanceM = 0;
   private incidents = 0;
   private decisions = 0;
+  private decisionsFailed = 0;
   private maneuversDone = 0;
   private lastDecel = 0;
   private crashed = false;
@@ -655,6 +660,7 @@ export class AutopilotGame {
    */
   private noteDecisionFailure(msg: string) {
     this.consecFails++;
+    this.decisionsFailed++;
     this.status = "error";
     this.accelCmd = this.consecFails < 3 ? "brake" : "maintain";
     if (!this.errorNotified) {
@@ -998,6 +1004,7 @@ export class AutopilotGame {
       const t = this.traffic.find((x) => x.id === this.overtakeId);
       if (!t || this.s > t.s + CAR_LEN_M + 1.5) {
         this.overtakeId = null; // passed it (or it disappeared)
+        this.overtakeReturnT = 2.5; // right indicator while rejoining the lane
       } else {
         t.latOff = Math.min(1.35, (t.latOff ?? 0) + dt * 0.9); // it yields to the curb
         this.teslaLat = Math.max(LANE - 1.05, this.teslaLat - dt * 0.9); // we hug the line
@@ -1020,6 +1027,16 @@ export class AutopilotGame {
         this.blockedWaitS = 0;
       }
     }
+    // indicator state for the renderer: LEFT while waiting to pass / passing
+    // (we are or will be out of our lane), RIGHT while moving back into it
+    if (this.overtakeId !== null || this.blockedWaitS > 1) {
+      this.overtakeSignal = "passing";
+    } else if (this.overtakeReturnT > 0) {
+      this.overtakeSignal = "returning";
+      this.overtakeReturnT = Math.max(0, this.overtakeReturnT - dt);
+    } else {
+      this.overtakeSignal = null;
+    }
     // telemetry: any real overspeed time (limit+3 while moving)
     if (this.speedKmh > 5 && this.speedKmh > limit + 3) {
       this.overspeedS += dt;
@@ -1032,32 +1049,51 @@ export class AutopilotGame {
     // what accelCmd says. Same for a vehicle we're closing on too fast.
     if (!this.emergency) {
       const vMs = this.speedKmh / 3.6;
-      if (pedNow && pedNow.distanceM > 0.1 && pedNow.distanceM < 60) {
-        const ds = pedNow.distanceM;
-        // walkers heading for our lane get a wider early corridor so we shed
-        // speed PROGRESSIVELY (no last-metre emergency slam → no incidents);
-        // dogs are erratic → always wide corridor and a near-stop cap
-        const corridor = pedNow.closing || pedNow.kind === "perro" ? 2.7 : 1.7;
-        if (Math.abs(pedNow.lateralM) < corridor && pedNow.clearsInS > 0.05) {
-          const tArrive = ds / Math.max(vMs, 0.6);
-          if (pedNow.clearsInS > tArrive - 0.55) {
-            const cap = pedNow.kind === "perro" ? 3.0 : 4.5;
-            let vAllowMs = Math.min(ds / (pedNow.clearsInS + 0.45), cap);
-            // they are directly in front of us RIGHT NOW: stop behind them
-            // (creep to ~3 m), never roll through at crossing speed
-            if (Math.abs(pedNow.lateralM) < 1.1) {
-              vAllowMs = Math.min(vAllowMs, Math.max((ds - 3.2) / 1.5, 0));
-            }
-            if (vMs > vAllowMs + 0.25) {
-              const needMs2 = (vMs * vMs - vAllowMs * vAllowMs) / (2 * Math.max(ds - 1.5, 1));
-              // exact needed decel when possible; only a true close call (<12 m)
-              // deserves a hard stop
-              const floor = ds < 12 ? BRAKE * 0.8 : 6;
-              const decel = Math.min(EMERGENCY_BRAKE, Math.max(floor, needMs2 * 3.6));
-              this.speedKmh = Math.max(vAllowMs * 3.6, this.speedKmh - decel * dt);
-              this.brakeTag = "aeb-ped";
-            }
-          }
+      // ── crossing-entity AEB ──
+      // Safety scans ALL walkers itself: the perception layer only reports the
+      // nearest one within 45 m, but at 130 km/h a walker 100 m ahead is 2.7 s
+      // away — still ours to handle. The old logic also had a hole: a walker
+      // just OUTSIDE the 2.3 m corridor reports clearsInS = 0 and was ignored
+      // until ~0.2 s from impact (a fast dog = guaranteed "atropello").
+      // Fix: horizon scales with stopping distance; braking is planned from
+      // the time the walker LEAVES the danger band, never from a zero clearance.
+      const scanM = Math.max(45, 12 + (vMs * vMs) / 8);
+      for (const c of this.crossings) {
+        if (c.done) continue;
+        const ds = c.s - this.s;
+        if (ds < -2 || ds > scanM) continue;
+        const lat = c.lateral - LANE; // signed offset from our lane centre
+        const latV = (Math.sign(c.to - c.from) || 1) * c.speed;
+        // danger half-width: dog gets extra margin (erratic)
+        const half = c.kind === "perro" ? 2.1 : 1.7;
+        // will they sweep the danger band before we pass?
+        const tArrive = ds / Math.max(vMs, 0.6);
+        const latThen = lat + latV * tArrive;
+        const lo = Math.min(lat, latThen);
+        const hi = Math.max(lat, latThen);
+        if (lo > half || hi < -half) continue; // never in our path
+        // when do they LEAVE the band? (0 = already out on the far side;
+        // Infinity = stopped inside it → we must stop before them)
+        let tLeave: number;
+        if (Math.abs(latV) < 0.05) {
+          tLeave = Math.abs(lat) < half ? Infinity : 0;
+        } else {
+          tLeave = (Math.sign(latV) * half - lat) / latV;
+          if (tLeave < 0) tLeave = 0;
+        }
+        // arrive only after they clear (+margin); a stopped walker drives
+        // vAllow → 0 = full stop behind them
+        let vAllowMs = ds / (tLeave + 0.55);
+        // directly in front of us RIGHT NOW: creep to ~3.2 m behind them
+        if (Math.abs(lat) < 1.1) vAllowMs = Math.min(vAllowMs, Math.max((ds - 3.2) / 1.5, 0));
+        vAllowMs = Math.max(0, Math.min(vAllowMs, c.kind === "perro" ? 3.0 : 4.5));
+        if (vMs > vAllowMs + 0.25) {
+          const needMs2 = (vMs * vMs - vAllowMs * vAllowMs) / (2 * Math.max(ds - 1.5, 1));
+          // exact needed decel when possible; a true close call (<12 m) brakes hard
+          const floor = ds < 12 ? BRAKE * 0.8 : 6;
+          const decel = Math.min(EMERGENCY_BRAKE, Math.max(floor, needMs2 * 3.6));
+          this.speedKmh = Math.max(vAllowMs * 3.6, this.speedKmh - decel * dt);
+          this.brakeTag = "aeb-ped";
         }
       }
       // vehicle AEB: any closing > 0.4 m/s sheds speed early and
@@ -1194,6 +1230,8 @@ export class AutopilotGame {
       distanceM: Math.round(this.distanceM),
       incidents: this.incidents,
       decisions: this.decisions,
+      decisionsFailed: this.decisionsFailed,
+      crashReason: this.crashReason,
       autopilot: this.mode === "autopilot",
       emergency: this.emergency,
     };
@@ -1217,6 +1255,7 @@ export class AutopilotGame {
       laneOffset: LANE,
       dest: this.destLocal,
       nextManeuver: this.nextManeuver(),
+      overtakeSignal: this.overtakeSignal,
       steps: this.steps,
       elapsed: this.elapsed,
       crashed: this.crashed,

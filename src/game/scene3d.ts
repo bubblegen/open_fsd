@@ -120,7 +120,7 @@ export class Scene3D {
 
   // dynamic pools
   private tesla!: VehicleMesh & {
-    signals: { l: THREE.Sprite; r: THREE.Sprite };
+    signals: { l: THREE.Sprite; r: THREE.Sprite; rl: THREE.Sprite; rr: THREE.Sprite };
     ring: THREE.Mesh;
     cones: THREE.Mesh[];
     wheels: THREE.Mesh[];
@@ -1044,16 +1044,16 @@ export class Scene3D {
     ring.position.y = 0.05;
     g.add(ring);
 
-    // turn signals
+    // turn signals: front fender + rear tail (the chase cam sees the rear ones)
     const texAmber = glowTexture("rgba(255,190,60,1)");
-    const mkSig = (x: number) => {
+    const mkSig = (x: number, z: number, scale = 1.4) => {
       const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: texAmber, color: 0xffbe3c, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
-      spr.position.set(x, 0.72, 1.9);
-      spr.scale.set(1.4, 1.4, 1);
+      spr.position.set(x, 0.72, z);
+      spr.scale.set(scale, scale, 1);
       g.add(spr);
       return spr;
     };
-    const signals = { l: mkSig(-0.95), r: mkSig(0.95) };
+    const signals = { l: mkSig(-0.95, 1.9), r: mkSig(0.95, 1.9), rl: mkSig(-0.88, -2.15, 1.25), rr: mkSig(0.88, -2.15, 1.25) };
 
     // headlight beam cones (brighter at dusk)
     const cones: THREE.Mesh[] = [];
@@ -1126,17 +1126,22 @@ export class Scene3D {
     if (rs.autopilot) {
       (tes.ring.material as THREE.MeshBasicMaterial).opacity = 0.22 + 0.14 * Math.sin(t * 3.2);
     }
-    // turn signals when approaching a turn
+    // turn signals: approaching a turn, or overtaking a stopped car —
+    // LEFT while waiting/moving out to pass, RIGHT when rejoining the lane
     const man = rs.nextManeuver;
     const blink = Math.sin(t * 9) > 0;
     let want: "l" | "r" | null = null;
-    if (man && man.distanceM < 70 && man.distanceM > 3) {
+    if (man && man.distanceM < 70) {
       if (man.modifier === "left" || man.modifier === "slight left") want = "l";
       else if (man.modifier === "right" || man.modifier === "slight right") want = "r";
       else if (man.type === "roundabout" || man.type === "rotary") want = "r";
     }
+    if (!want && rs.overtakeSignal === "passing") want = "l";
+    else if (!want && rs.overtakeSignal === "returning") want = "r";
     tes.signals.l.material.opacity = want === "l" && blink ? 0.95 : 0;
     tes.signals.r.material.opacity = want === "r" && blink ? 0.95 : 0;
+    tes.signals.rl.material.opacity = want === "l" && blink ? 0.95 : 0;
+    tes.signals.rr.material.opacity = want === "r" && blink ? 0.95 : 0;
 
     // traffic lights cycle slowly (decorative, GTA-style)
     for (const tl of this.trafficLights) {
