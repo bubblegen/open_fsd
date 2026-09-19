@@ -375,8 +375,13 @@ export class AutopilotGame {
     if (performance.now() - this.lastCrossingDoneWall < 8000) return;
     // spawn at upcoming maneuver locations (intersections)
     const man = this.nextManeuver();
+    // never spawn a walker closer than our reflex horizon: a pedestrian
+    // stepping off the curb inside our braking distance is physically
+    // unwinnable no matter how good the AEB is
+    const vMs = this.speedKmh / 3.6;
+    const minSpawn = Math.max(28, 12 + (vMs * vMs) / 8);
     const candidates = [man?.s, this.peekManeuver(1)?.s]
-      .filter((v): v is number => typeof v === "number" && v > this.s + 25)
+      .filter((v): v is number => typeof v === "number" && v > this.s + minSpawn)
       .filter((v) => Math.abs(v - this.s) < 450)
       .filter((v) => Math.abs(v - this.lastCrossingS) > 30);
     if (candidates.length === 0 || Math.random() < 0.35) return;
@@ -469,6 +474,28 @@ export class AutopilotGame {
       if (ds > 0.5 && ds < 150 && (!best || t.s < best.s)) best = t;
     }
     return best;
+  }
+
+  /** Would an oncoming car reach us before a pass completes? Time-based, not
+   *  distance-based: a far-away slow car is fine, a fast one 300 m away is
+   *  not. Anything already alongside (ds ∈ [-12, 0]) blocks immediately. */
+  private oncomingConflict(gapM: number, passKmh: number, leaderKmh: number): boolean {
+    const rel = Math.max((passKmh - leaderKmh) / 3.6, 0.5);
+    const tPass = (gapM + CAR_LEN_M + 2) / rel + 1.5;
+    for (const t of this.traffic) {
+      if (t.dir !== -1) continue;
+      const ds = t.s - this.s;
+      if (ds > -12 && ds <= 0) return true;
+      if (ds <= 0) continue;
+      const tOn = ds / Math.max(t.speedMs, 4);
+      if (tOn < tPass + 1.5) return true;
+    }
+    return false;
+  }
+
+  /** Pace we intend to pass at, given the leader's speed. */
+  private passSpeedFor(leaderKmh: number): number {
+    return Math.min(20, Math.max(8, leaderKmh + 8));
   }
 
   private vehicleAhead(): { type: string; distanceM: number; speedKmh: number } | null {
@@ -787,6 +814,10 @@ export class AutopilotGame {
     // advance traffic (simple car-following for same-direction flow)
     const ourLimit = this.currentLimit();
     for (const t of this.traffic) {
+      // a car we squeezed past drifts back to its lane once the pass is over
+      if (t.id !== this.overtakeId) {
+        t.latOff = Math.max(0, (t.latOff ?? 0) - dt * 0.6);
+      }
       // traffic obeys the limit signs of the stretch it is on: vehicles
       // spawned in a 50 zone must speed up once they reach the 120 motorway
       if (t.dir === 1) {
@@ -851,12 +882,15 @@ export class AutopilotGame {
     for (const t of this.traffic) {
       if (t.dir !== 1) continue;
       const ds = t.s - this.s;
+      // genuinely dawdling cars only (a 42-in-a-50 is normal flow, keep it);
       // stopped cars are handled by the wait-then-overtake flow, not removed
-      if (ds > 0.5 && ds < 60 && t.speedMs * 3.6 < limit * 0.85 && t.speedMs * 3.6 > 3) slowAhead = t;
+      if (ds > 0.5 && ds < 60 && t.speedMs * 3.6 < limit * 0.5 && t.speedMs * 3.6 >= 3) slowAhead = t;
     }
-    if (slowAhead && this.speedKmh < limit * 0.8) {
+    if (slowAhead && this.speedKmh < limit * 0.55) {
       this.stuckBehindS += dt;
-      if (this.stuckBehindS > 6) {
+      // long fuse: the overtake flow gets first crack at anything under 15
+      // km/h; this only clears true rolling roadblocks (they "took an exit")
+      if (this.stuckBehindS > 14) {
         this.stuckBehindS = 0;
         this.traffic = this.traffic.filter((t) => t.id !== slowAhead!.id);
       }
@@ -997,34 +1031,56 @@ export class AutopilotGame {
         this.brakeTag = "limit-ahead";
       }
     }
-    // wait-then-overtake: a FULLY STOPPED car blocks our lane. Real behaviour:
-    // wait a few seconds, then creep past it at walking pace while it pulls
-    // toward the curb and we shift toward the centre line (never a pass-through)
+    // wait-then-overtake: a STOPPED or CRAWLING (<15 km/h) car blocks our lane.
+    // Real behaviour: wait a few seconds with the left indicator on, then pass
+    // it slowly while it yields toward the curb — but ONLY when the oncoming
+    // lane is clear. During the pass we re-check oncoming: if a car appears
+    // we abort, hold our lateral offset, let it pass (≥2.7 m separation) and
+    // re-join or re-try after. The speed cap applies UNCONDITIONALLY while
+    // passing (the old !emergency exemption let the car fly past at full
+    // throttle whenever Jev flagged immediate danger).
     if (this.overtakeId !== null) {
       const t = this.traffic.find((x) => x.id === this.overtakeId);
-      if (!t || this.s > t.s + CAR_LEN_M + 1.5) {
-        this.overtakeId = null; // passed it (or it disappeared)
+      const done = !t || this.s > t.s + CAR_LEN_M + 1.5;
+      const resumed = t !== undefined && t.speedMs * 3.6 > 18;
+      const leaderKmhNow = t ? t.speedMs * 3.6 : 0;
+      const passNow = this.passSpeedFor(leaderKmhNow);
+      const gapNow = t ? t.s - this.s : Infinity;
+      const oncomingNow = this.oncomingConflict(gapNow, passNow, leaderKmhNow);
+      if (done || resumed || oncomingNow) {
+        this.overtakeId = null; // passed / it drove off / yield to oncoming
         this.overtakeReturnT = 2.5; // right indicator while rejoining the lane
       } else {
         t.latOff = Math.min(1.35, (t.latOff ?? 0) + dt * 0.9); // it yields to the curb
         this.teslaLat = Math.max(LANE - 1.05, this.teslaLat - dt * 0.9); // we hug the line
-        if (!this.emergency) {
-          this.speedKmh = Math.min(this.speedKmh, 6); // walking pace past it
-          if (this.speedKmh < 5) this.speedKmh = Math.min(5, this.speedKmh + 5 * dt);
+        // pass at walking-to-brisk pace relative to the leader, never flat out
+        this.speedKmh = Math.min(this.speedKmh, passNow);
+        if (this.speedKmh < passNow - 1) {
+          this.speedKmh = Math.min(passNow, this.speedKmh + 4 * dt);
         }
       }
     }
     if (this.overtakeId === null) {
-      // relax back into our lane once the pass is done
+      // relax back into our lane once the pass is done (or was aborted)
       this.teslaLat += (LANE - this.teslaLat) * Math.min(1, dt * 1.2);
-      if (leader && leader.speedMs * 3.6 < 3 && gapM < 16 && this.speedKmh < 3) {
+      const leaderKmh = leader ? leader.speedMs * 3.6 : 999;
+      const stuckBehindStopped = this.speedKmh < 5;
+      const dawdlingBehindCrawler =
+        this.speedKmh < leaderKmh + 6 && this.speedKmh < limit * 0.5;
+      if (
+        leader &&
+        leaderKmh < 15 && // stopped or crawling
+        gapM < 25 &&
+        (stuckBehindStopped || dawdlingBehindCrawler) &&
+        !this.oncomingConflict(gapM, this.passSpeedFor(leaderKmh), leaderKmh) // opposite lane must be time-clear
+      ) {
         this.blockedWaitS += dt;
-        if (this.blockedWaitS > 6) {
+        if (this.blockedWaitS > 5) {
           this.overtakeId = leader.id; // enough waiting — pass it slowly
           this.blockedWaitS = 0;
         }
       } else {
-        this.blockedWaitS = 0;
+        this.blockedWaitS = Math.max(0, this.blockedWaitS - dt * 2);
       }
     }
     // indicator state for the renderer: LEFT while waiting to pass / passing
@@ -1106,7 +1162,11 @@ export class AutopilotGame {
         const closingMs = vMs - leaderMs;
         const window = Math.min(150, (closingMs * closingMs) / 7 + 14);
         if (closingMs > 0.4 && gapM < window) {
-          const needMs2 = (closingMs * closingMs) / (2 * Math.max(gapM - 5, 1));
+          // aim to MATCH the leader's speed with a real 3 m bumper buffer
+          // (gapM is centre distance, CAR_LEN_M = 4.6). Targeting the old
+          // zero buffer turned the last metres into discrete-time chicken:
+          // residual closing at contact > 18 km/h registered as a crash.
+          const needMs2 = (closingMs * closingMs) / (2 * Math.max(gapM - 7.6, 1));
           const decel = Math.min(EMERGENCY_BRAKE, Math.max(5, needMs2 * 3.6));
           if (vMs > leaderMs + 0.3) {
             this.speedKmh = Math.max(leaderMs * 3.6, this.speedKmh - decel * dt);

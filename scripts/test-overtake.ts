@@ -28,7 +28,12 @@ const accelerateAlways = (_s: PerceptionState): Promise<DecideResponse> =>
 
 interface Ctx { engine: AutopilotGame; car: any; minDs: number; maxPassSpeed: number; passed: boolean; waitedS: number }
 
-async function scenario(name: string, startSpeedKmh: number, stoppedAtM: number): Promise<Ctx> {
+async function scenario(
+  name: string,
+  startSpeedKmh: number,
+  stoppedAtM: number,
+  opts: { victimKmh?: number; oncomingAtM?: number } = {},
+): Promise<Ctx & { midPassLat: number; signals: Set<string>; overtakeTried: boolean }> {
   const res = await fetch(ROUTE_URL);
   const j = await res.json();
   const route = (j as { result: { data: { json: RouteData } } }).result.data.json;
@@ -46,18 +51,24 @@ async function scenario(name: string, startSpeedKmh: number, stoppedAtM: number)
   );
   const e = engine as any;
   e.speedKmh = startSpeedKmh;
+  const victimKmh = opts.victimKmh ?? 0;
   const car = {
-    id: 9999, s: e.s + stoppedAtM, dir: 1, speedMs: 0, baseSpeedMs: 0,
+    id: 9999, s: e.s + stoppedAtM, dir: 1, speedMs: victimKmh / 3.6, baseSpeedMs: victimKmh / 3.6,
     kind: "car", color: "#ffffff", changing: false, latOff: 0,
   };
+  const oncoming = opts.oncomingAtM !== undefined ? {
+    id: 8888, s: e.s + opts.oncomingAtM, dir: -1, speedMs: 50 / 3.6, baseSpeedMs: 50 / 3.6,
+    kind: "car", color: "#000000", changing: false, latOff: 0,
+  } : null;
   const ctx: Ctx = { engine, car, minDs: Infinity, maxPassSpeed: 0, passed: false, waitedS: 0 };
   let prevWait = 0;
   let midPassLat = 0; // lateral separation recorded when longitudinally alongside
   const signals = new Set<string>(); // indicator states observed during the flow
   for (let i = 0; i < 3600; i++) { // 180 sim-seconds max
-    e.traffic = [car]; // only our victim; spawnTraffic re-adds nothing
+    if (oncoming) oncoming.s = e.s + (opts.oncomingAtM ?? 100); // continuous stream pinned
+    e.traffic = oncoming ? [car, oncoming] : [car];
     e.crossings = []; // no random pedestrians: deterministic vehicle-only test
-    car.speedMs = 0; car.baseSpeedMs = 0; // stays stopped
+    car.speedMs = victimKmh / 3.6; car.baseSpeedMs = victimKmh / 3.6; // pin victim's speed
     engine.update(0.05);
     if (e.overtakeSignal) signals.add(e.overtakeSignal);
     const ds = car.s - e.s;
@@ -75,24 +86,28 @@ async function scenario(name: string, startSpeedKmh: number, stoppedAtM: number)
   console.log(`${name}: min ds(aprox)=${ctx.minDs.toFixed(2)}m (parachoques ${bumper.toFixed(2)}m) | ` +
     `espera=${ctx.waitedS.toFixed(1)}s | adelantó=${ctx.passed} | v_max_paso=${ctx.maxPassSpeed.toFixed(1)} km/h | ` +
     `sep.lateral paso=${midPassLat.toFixed(2)}m | intermitentes=[${[...signals].join(",")}] | crash=${e.crashed}${e.crashed ? ` (${e.crashReason})` : ""}`);
-  return { ...ctx, midPassLat, signals } as Ctx & { midPassLat: number; signals: Set<string> };
+  return { ...ctx, midPassLat, signals, overtakeTried: e.overtakeId !== null || signals.has("passing") } as Ctx & { midPassLat: number; signals: Set<string>; overtakeTried: boolean };
 }
 
 async function main() {
   const a = await scenario("A) 50 km/h → coche parado a 120m", 50, 120);
   const b = await scenario("B) 8 km/h → coche parado a 15m (ex-fantasma)", 8, 15);
   const c = await scenario("C) 120 km/h → coche parado a 260m", 120, 260);
+  const d = await scenario("D) 60 km/h → coche a 10 km/h a 100m (lento)", 60, 100, { victimKmh: 10 });
+  const x = await scenario("X) 40 km/h → parado a 60m CON contrario a 100m", 40, 60, { oncomingAtM: 100 });
   const lat = (c: Ctx & { midPassLat: number }) => c.midPassLat;
   const ok =
-    !a.engine.crashed && !b.engine.crashed && !c.engine.crashed &&
-    a.minDs >= 4.4 && b.minDs >= 4.4 && // never touched on approach, let alone through
-    a.passed && b.passed && // eventually crept past
-    a.maxPassSpeed <= 6.6 && b.maxPassSpeed <= 6.6 &&
-    lat(a) >= 1.8 && lat(b) >= 1.8 && // real lateral separation while alongside
-    c.minDs >= 4.4 && // motorway-speed stop also keeps bumper margin
+    !a.engine.crashed && !b.engine.crashed && !c.engine.crashed && !d.engine.crashed && !x.engine.crashed &&
+    a.minDs >= 6.0 && b.minDs >= 6.0 && c.minDs >= 6.0 && d.minDs >= 6.0 && // AEB holds a real buffer now
+    a.passed && b.passed && d.passed && // stopped/crawling eventually passed
+    a.maxPassSpeed <= 12 && b.maxPassSpeed <= 12 && // walking pace past a stopped car
+    d.maxPassSpeed <= 21 && // brisk-but-safe past a 10 km/h crawler
+    lat(a) >= 1.8 && lat(b) >= 1.8 && lat(d) >= 1.8 && // real lateral separation while alongside
+    !x.passed && !x.overtakeTried && // oncoming lane occupied → we wait, never pull out
     a.signals.has("passing") && a.signals.has("returning") && // L to pass, R to rejoin
-    b.signals.has("passing") && b.signals.has("returning");
-  console.log(ok ? "OK: cuerpos sólidos, espera + adelantamiento lento" : "FALLO");
+    b.signals.has("passing") && b.signals.has("returning") &&
+    d.signals.has("passing") && d.signals.has("returning");
+  console.log(ok ? "OK: cuerpos sólidos con margen, espera + adelantamiento lento y seguro, sin salir con contrario" : "FALLO");
   process.exit(ok ? 0 : 1);
 }
 main().catch((e) => { console.error(e); process.exit(1); });
