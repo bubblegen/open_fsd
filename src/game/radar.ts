@@ -7,7 +7,7 @@
 import type { RenderState } from "./engine";
 import { TILE_ZOOM, tileImg, globalPx, metersPerPixel } from "./tiles2d";
 
-const SIZE = 168; // css px — small reference ball, not a main view
+const SIZE = 118; // css px — small reference ball, not a main view
 
 export class Radar {
   private ctx: CanvasRenderingContext2D;
@@ -151,21 +151,21 @@ export class Radar {
     const rx = Math.sin(theta);
     const ry = -Math.cos(theta);
     ctx.fillStyle = "rgba(226,232,240,0.9)";
-    ctx.font = `bold ${11 * this.dpr}px ui-sans-serif, system-ui`;
+    ctx.font = `bold ${8 * this.dpr}px ui-sans-serif, system-ui`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText("N", cx + rx * nDist, cy + ry * nDist);
 
     // speed (bottom) + limit (top-left) inside the dial
     ctx.fillStyle = "#e2e8f0";
-    ctx.font = `bold ${22 * this.dpr}px ui-monospace, monospace`;
+    ctx.font = `bold ${16 * this.dpr}px ui-monospace, monospace`;
     ctx.fillText(`${Math.round(rs.speedKmh)}`, cx, cy + R - 34 * this.dpr);
-    ctx.font = `${9 * this.dpr}px ui-sans-serif, system-ui`;
+    ctx.font = `${7 * this.dpr}px ui-sans-serif, system-ui`;
     ctx.fillStyle = "#94a3b8";
     ctx.fillText("km/h", cx, cy + R - 16 * this.dpr);
 
     // limit badge
-    const lbR = 13 * this.dpr;
+    const lbR = 9 * this.dpr;
     const lbx = cx - R + 26 * this.dpr;
     const lby = cy - R + 26 * this.dpr;
     ctx.beginPath();
@@ -176,7 +176,7 @@ export class Radar {
     ctx.lineWidth = 3 * this.dpr;
     ctx.stroke();
     ctx.fillStyle = "#f8fafc";
-    ctx.font = `bold ${11 * this.dpr}px ui-monospace, monospace`;
+    ctx.font = `bold ${8 * this.dpr}px ui-monospace, monospace`;
     ctx.fillText(`${rs.limit}`, lbx, lby);
 
     // outer ring
