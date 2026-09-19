@@ -1155,7 +1155,7 @@ export class Scene3D {
         v = this.makeVehicle(tc.kind, tc.color);
         this.vehicles.set(tc.id, v);
       }
-      const laneOff = tc.dir === 1 ? rs.laneOffset : -rs.laneOffset;
+      const laneOff = (tc.dir === 1 ? rs.laneOffset : -rs.laneOffset) + (tc.latOff ?? 0);
       const p = rs.poly.atOffset(tc.s, laneOff);
       v.group.position.set(p.x, 0, p.y);
       v.group.rotation.y = Math.PI / 2 - (tc.dir === 1 ? p.angle : p.angle + Math.PI);

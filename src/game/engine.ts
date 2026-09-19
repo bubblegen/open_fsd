@@ -54,6 +54,7 @@ export interface TrafficCar {
   kind: TrafficKind;
   color: string;
   changing: boolean; // overtaking wiggle
+  latOff?: number; // extra lateral offset (pulled to the curb when we pass)
 }
 
 export interface CrossingEntity {
@@ -175,6 +176,9 @@ export class AutopilotGame {
   public incidentCauses: Record<string, number> = {};
   public overspeedS = 0; // time spent above limit+3 while moving
   public topOverKmh = 0; // worst overspeed vs current limit
+  private overtakeId: number | null = null; // stopped car we are creeping past
+  private blockedWaitS = 0; // time spent waiting behind a stopped car
+  private teslaLat = LANE; // lateral offset (shifts toward centre to pass)
   private consecFails = 0;
   private errorNotified = false;
   private decisionEveryMs: number;
@@ -336,6 +340,7 @@ export class AutopilotGame {
           Math.floor(Math.random() * 6)
         ],
         changing: false,
+        latOff: 0,
       });
     } else if (oncoming < 5) {
       const kind: TrafficKind =
@@ -351,6 +356,7 @@ export class AutopilotGame {
         kind,
         color: kind === "police" ? "#22262c" : kind === "ambulance" ? "#f0f2f5" : "#8e99a8",
         changing: false,
+        latOff: 0,
       });
     }
   }
@@ -839,7 +845,8 @@ export class AutopilotGame {
     for (const t of this.traffic) {
       if (t.dir !== 1) continue;
       const ds = t.s - this.s;
-      if (ds > 0.5 && ds < 60 && t.speedMs * 3.6 < limit * 0.85) slowAhead = t;
+      // stopped cars are handled by the wait-then-overtake flow, not removed
+      if (ds > 0.5 && ds < 60 && t.speedMs * 3.6 < limit * 0.85 && t.speedMs * 3.6 > 3) slowAhead = t;
     }
     if (slowAhead && this.speedKmh < limit * 0.8) {
       this.stuckBehindS += dt;
@@ -870,7 +877,9 @@ export class AutopilotGame {
       pedBrakeFactor = ds < 10 ? 1 : ds < 22 ? 0.6 : 0.35;
     }
 
-    if (this.emergency) {
+    if (this.overtakeId !== null) {
+      // passing a stopped car: speed is owned by the overtake block below
+    } else if (this.emergency) {
       this.speedKmh = Math.max(0, this.speedKmh - EMERGENCY_BRAKE * dt);
       this.brakeTag = "emergency";
     } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
@@ -982,6 +991,35 @@ export class AutopilotGame {
         this.brakeTag = "limit-ahead";
       }
     }
+    // wait-then-overtake: a FULLY STOPPED car blocks our lane. Real behaviour:
+    // wait a few seconds, then creep past it at walking pace while it pulls
+    // toward the curb and we shift toward the centre line (never a pass-through)
+    if (this.overtakeId !== null) {
+      const t = this.traffic.find((x) => x.id === this.overtakeId);
+      if (!t || this.s > t.s + CAR_LEN_M + 1.5) {
+        this.overtakeId = null; // passed it (or it disappeared)
+      } else {
+        t.latOff = Math.min(1.35, (t.latOff ?? 0) + dt * 0.9); // it yields to the curb
+        this.teslaLat = Math.max(LANE - 1.05, this.teslaLat - dt * 0.9); // we hug the line
+        if (!this.emergency) {
+          this.speedKmh = Math.min(this.speedKmh, 6); // walking pace past it
+          if (this.speedKmh < 5) this.speedKmh = Math.min(5, this.speedKmh + 5 * dt);
+        }
+      }
+    }
+    if (this.overtakeId === null) {
+      // relax back into our lane once the pass is done
+      this.teslaLat += (LANE - this.teslaLat) * Math.min(1, dt * 1.2);
+      if (leader && leader.speedMs * 3.6 < 3 && gapM < 16 && this.speedKmh < 3) {
+        this.blockedWaitS += dt;
+        if (this.blockedWaitS > 6) {
+          this.overtakeId = leader.id; // enough waiting — pass it slowly
+          this.blockedWaitS = 0;
+        }
+      } else {
+        this.blockedWaitS = 0;
+      }
+    }
     // telemetry: any real overspeed time (limit+3 while moving)
     if (this.speedKmh > 5 && this.speedKmh > limit + 3) {
       this.overspeedS += dt;
@@ -1022,12 +1060,16 @@ export class AutopilotGame {
           }
         }
       }
-      // vehicle AEB: any meaningful closing speed starts shedding EARLY and
-      // PROGRESSIVELY (exact needed decel), so we never reach bumper range
-      if (veh && gapM < 34) {
+      // vehicle AEB: any closing > 0.4 m/s sheds speed early and
+      // progressively. The engage window scales with closing speed — the
+      // distance a comfortable 3.5 m/s² stop needs plus a small buffer — so
+      // even a motorway-speed approach to a stopped car starts braking in
+      // time (before, the fixed 34 m window made 120→0 a guaranteed crash).
+      if (veh && (!leader || leader.id !== this.overtakeId)) {
         const leaderMs = leader ? leader.speedMs : 0;
         const closingMs = vMs - leaderMs;
-        if (closingMs > 1.2) {
+        const window = Math.min(150, (closingMs * closingMs) / 7 + 14);
+        if (closingMs > 0.4 && gapM < window) {
           const needMs2 = (closingMs * closingMs) / (2 * Math.max(gapM - 5, 1));
           const decel = Math.min(EMERGENCY_BRAKE, Math.max(5, needMs2 * 3.6));
           if (vMs > leaderMs + 0.3) {
@@ -1094,13 +1136,18 @@ export class AutopilotGame {
       }
     }
 
-    // rear-end: crash only with a real closing speed; a light tap is an incident
-    if (veh && gapM < CAR_LEN_M * 0.55 && this.speedKmh > 10) {
+    // rear-end: vehicles are SOLID at any speed. Bumper-to-bumper distance is
+    // ds - CAR_LEN_M, so contact happens at ds ≈ CAR_LEN_M (the old trigger at
+    // CAR_LEN_M*0.55 plus a speed>10 gate let slow cars be ghosted through).
+    // While we are overtaking a stopped car we are laterally separated from
+    // it, so it is exempt from the clamp (we must be allowed to get alongside).
+    const passing = leader !== null && leader.id === this.overtakeId;
+    if (veh && gapM <= CAR_LEN_M + 0.4 && !passing) {
       const closing = leader ? this.speedKmh - leader.speedMs * 3.6 : 99;
       if (closing > 18) {
         return this.crash(`Colisión por alcance con ${veh.type}`);
       }
-      // light contact: count an incident and match the leader's speed
+      // light contact: count an incident, match speed, never pass through
       this.incidents++;
       this.score = Math.max(0, this.score - 50);
       this.speedKmh = Math.max(0, leader ? leader.speedMs * 3.6 : 0);
@@ -1157,7 +1204,7 @@ export class AutopilotGame {
       proj: this.proj,
       poly: this.poly,
       s: this.s,
-      car: this.poly.atOffset(this.s, LANE),
+      car: this.poly.atOffset(this.s, this.teslaLat),
       accelCmd: this.accelCmd,
       autopilot: this.mode === "autopilot",
       speedKmh: this.speedKmh,
