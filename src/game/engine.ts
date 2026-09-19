@@ -22,6 +22,12 @@ const DRAG = 1;
 const DANGER_THRESHOLD = 0.55;
 const FIXED_STEP_S = 0.05;
 const MAX_CATCHUP_S = 2.0;
+
+/* deterministic pseudo-random in [0,1) from any number */
+function hash(n: number): number {
+  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
 const MANEUVER_SAFE_THRESHOLD = 0.4;
 const HARD_BRAKE_INCIDENT = 34; // above BRAKE (30): only true emergency braking counts
 const LANE = 1.9; // meters, right-hand traffic
@@ -299,15 +305,23 @@ export class AutopilotGame {
     const roll = Math.random();
     if (roll < 0.62 && forward < 7) {
       const kind: TrafficKind =
-        Math.random() < 0.08 ? "truck" : Math.random() < 0.25 ? "taxi" : "car";
-      const factor = kind === "truck" ? 0.72 : 0.82 + Math.random() * 0.15;
+        Math.random() < 0.06 ? "truck" : Math.random() < 0.25 ? "taxi" : "car";
+      // realistic flow: cars cruise a bit above the limit; trucks are capped
+      // by law (90 on motorways, ~80 on national roads) — Google-style times
+      // assume you overtake the slow ones, not follow them for 30 minutes
+      let baseKmh: number;
+      if (kind === "truck") {
+        baseKmh = limit >= 100 ? 90 : limit >= 80 ? 80 : Math.max(32, limit * 0.8);
+      } else {
+        baseKmh = Math.min(limit + 2 + Math.random() * 8, 132);
+      }
       const s = this.s + (initial ? 120 + Math.random() * 600 : 320 + Math.random() * 500);
       this.traffic.push({
         id: uid++,
         s,
         dir: 1,
-        speedMs: ((limit * factor) / 3.6) as number,
-        baseSpeedMs: (limit * factor) / 3.6,
+        speedMs: (baseKmh / 3.6) as number,
+        baseSpeedMs: baseKmh / 3.6,
         kind,
         color: ["#8e99a8", "#a86f5c", "#5c7a99", "#7a8c5c", "#99685c", "#c2c7ce"][
           Math.floor(Math.random() * 6)
@@ -669,8 +683,9 @@ export class AutopilotGame {
     // Jev gets a chance to mark it safe again
     if (!this.emergency && maneuverSafe < MANEUVER_SAFE_THRESHOLD) {
       if (this.speedKmh > 35) {
+        // slow down progressively for the maneuver, not an emergency stop
         this.accelCmd = "brake";
-        this.incidents++;
+        if (this.speedKmh > 55) this.incidents++;
       } else {
         this.accelCmd = "maintain";
       }
@@ -722,7 +737,21 @@ export class AutopilotGame {
     }
 
     // advance traffic (simple car-following for same-direction flow)
+    const ourLimit = this.currentLimit();
     for (const t of this.traffic) {
+      // traffic obeys the limit signs of the stretch it is on: vehicles
+      // spawned in a 50 zone must speed up once they reach the 120 motorway
+      if (t.dir === 1) {
+        const desired =
+          t.kind === "truck"
+            ? ourLimit >= 100
+              ? 90
+              : ourLimit >= 80
+                ? 80
+                : Math.max(30, ourLimit * 0.75)
+            : Math.min(ourLimit + 2 + hash(t.id) * 8, 132);
+        t.baseSpeedMs += (desired / 3.6 - t.baseSpeedMs) * Math.min(1, 0.4 * dt);
+      }
       let v = t.baseSpeedMs;
       if (t.dir === 1) {
         for (const o of this.traffic) {
@@ -766,17 +795,18 @@ export class AutopilotGame {
     const gapM = veh ? veh.distanceM : Infinity;
     const leader = this.nearestAhead();
 
-    // a much slower vehicle ahead eventually turns off the road so the
-    // trip doesn't stall behind a rolling roadblock
+    // a much slower vehicle ahead is eventually "overtaken" (it leaves the
+    // road or we change lanes) so the trip doesn't stall behind rolling
+    // roadblocks — threshold near the truck/legal-flow speed per road type
     let slowAhead: TrafficCar | null = null;
     for (const t of this.traffic) {
       if (t.dir !== 1) continue;
       const ds = t.s - this.s;
-      if (ds > 0.5 && ds < 45 && t.speedMs * 3.6 < limit * 0.55) slowAhead = t;
+      if (ds > 0.5 && ds < 60 && t.speedMs * 3.6 < limit * 0.85) slowAhead = t;
     }
-    if (slowAhead && this.speedKmh < limit * 0.65) {
+    if (slowAhead && this.speedKmh < limit * 0.8) {
       this.stuckBehindS += dt;
-      if (this.stuckBehindS > 9) {
+      if (this.stuckBehindS > 6) {
         this.stuckBehindS = 0;
         this.traffic = this.traffic.filter((t) => t.id !== slowAhead!.id);
       }
@@ -803,10 +833,17 @@ export class AutopilotGame {
       const leaderV = leader ? leader.speedMs * 3.6 : null;
       switch (this.accelCmd) {
         case "accelerate": {
-          // respect a safe following distance even when Jev says go
+          // respect a safe following distance even when Jev says go;
+          // approach the leader smoothly instead of brake-accel oscillation
           const safeGap = (this.speedKmh / 3.6) * 1.8 + 5;
-          if (veh && gapM < safeGap) {
+          if (veh && gapM < safeGap * 0.7) {
             this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+          } else if (veh && gapM < safeGap && leaderV !== null) {
+            if (this.speedKmh > leaderV + 1) {
+              this.speedKmh = Math.max(leaderV, this.speedKmh - BRAKE * 0.6 * dt);
+            } else if (this.speedKmh < leaderV - 2) {
+              this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.5 * dt);
+            }
           } else {
             this.speedKmh = Math.min(Math.min(limit + 8, MAX_SPEED), this.speedKmh + ACCEL * dt);
           }
@@ -838,7 +875,11 @@ export class AutopilotGame {
               break;
             }
           }
-          this.speedKmh = Math.max(0, this.speedKmh - DRAG * dt);
+          // hold speed instead of sawtooth coasting: only ease off when
+          // clearly above the limit (Jev says "maintain", not "slow down")
+          if (this.speedKmh > limit + 3) {
+            this.speedKmh = Math.max(0, this.speedKmh - DRAG * 1.5 * dt);
+          }
           break;
         }
       }
