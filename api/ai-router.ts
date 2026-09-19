@@ -30,6 +30,8 @@ export const aiRouter = createRouter({
             Authorization: `Bearer ${apiKey}`,
             "Content-Type": "application/json",
           },
+          // never let a hung upstream call freeze a game session
+          signal: AbortSignal.timeout(15000),
           body: JSON.stringify({
             model: TYPESAFE_MODEL,
             state: input.state,

@@ -31,5 +31,6 @@ export const trips = mysqlTable("trips", {
   incidents: int("incidents").notNull(),
   destinationsReached: int("destinations_reached").notNull(),
   crashed: mysqlEnum("crashed", ["yes", "no"]).notNull().default("no"),
+  arrived: mysqlEnum("arrived", ["yes", "no"]).notNull().default("no"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });

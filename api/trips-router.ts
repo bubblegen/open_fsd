@@ -17,6 +17,7 @@ export const tripsRouter = createRouter({
         incidents: z.number().int(),
         destinationsReached: z.number().int(),
         crashed: z.boolean(),
+        arrived: z.boolean(),
       }),
     )
     .mutation(async ({ input }) => {
@@ -30,6 +31,7 @@ export const tripsRouter = createRouter({
           incidents: input.incidents,
           destinationsReached: input.destinationsReached,
           crashed: input.crashed ? "yes" : "no",
+          arrived: input.arrived ? "yes" : "no",
         });
         return { ok: true };
       } catch (err) {

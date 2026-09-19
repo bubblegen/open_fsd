@@ -5,50 +5,384 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { Input } from "@/components/ui/input";
 import {
   ArrowUp,
   ArrowDown,
   Minus,
-  ArrowUpIcon,
   RotateCcw,
   Flag,
   AlertTriangle,
   Brain,
-  Eye,
   ListOrdered,
-  Database,
   Braces,
   Square,
   Play,
-  ChevronLeft,
-  ChevronRight,
+  MapPin,
+  Search,
+  ArrowLeftRight,
+  LocateFixed,
+  CornerUpLeft,
+  CornerUpRight,
+  RefreshCw,
+  Merge,
+  Gauge,
+  Navigation,
+  Loader2,
+  Car,
 } from "lucide-react";
 import { trpc } from "@/providers/trpc";
 import {
   AutopilotGame,
-  WORLD,
   type DecisionLogEntry,
   type DecisionView,
   type Snapshot,
   type TripResult,
 } from "@/game/engine";
-import { drawScene } from "@/game/renderer";
-import { DECISION_QUESTIONS, type DecideResponse, type Direction, type SpeedAction } from "@contracts/ai";
+import { Scene3D } from "@/game/scene3d";
+import { Radar } from "@/game/radar";
+import {
+  DECISION_QUESTIONS,
+  type DecideResponse,
+  type SpeedAction,
+  type CruiseChoice,
+} from "@contracts/ai";
+import type { GeoPlace, RouteData } from "@contracts/geo";
 
 const SPEED_LABEL: Record<SpeedAction, string> = {
   accelerate: "Acelerar",
   maintain: "Mantener",
   brake: "Frenar",
 };
-const DIR_LABEL: Record<Direction, string> = {
-  straight: "Recto",
-  left: "Izquierda",
-  right: "Derecha",
+const CRUISE_LABEL: Record<string, string> = {
+  cruise_80: "Crucero 80",
+  cruise_100: "Crucero 100",
+  cruise_120: "Crucero 120",
+  off: "Crucero OFF",
 };
-const HEADING_LABEL = { N: "Norte", E: "Este", S: "Sur", W: "Oeste" } as const;
+const CRUISE_VALUE: Record<string, number | null> = {
+  cruise_80: 80,
+  cruise_100: 100,
+  cruise_120: 120,
+  off: null,
+};
+
+const PRESETS: Array<{ label: string; from: string; to: string }> = [
+  { label: "Madrid: Sol → Chamartín", from: "Puerta del Sol, Madrid", to: "Estación de Chamartín, Madrid" },
+  { label: "Madrid: Sol → Bernabéu", from: "Puerta del Sol, Madrid", to: "Estadio Santiago Bernabéu, Madrid" },
+  { label: "BCN: Cataluña → Sagrada Família", from: "Plaça de Catalunya, Barcelona", to: "Sagrada Família, Barcelona" },
+];
 
 export default function Home() {
+  const [screen, setScreen] = useState<"setup" | "game">("setup");
+  const [origin, setOrigin] = useState<GeoPlace | null>(null);
+  const [destination, setDestination] = useState<GeoPlace | null>(null);
+  const [routeParams, setRouteParams] = useState<{
+    fromLat: number;
+    fromLon: number;
+    toLat: number;
+    toLon: number;
+  } | null>(null);
+
+  const routeQ = trpc.geo.route.useQuery(
+    routeParams ?? { fromLat: 0, fromLon: 0, toLat: 0, toLon: 0 },
+    { enabled: !!routeParams, retry: 1, staleTime: Infinity },
+  );
+
+  const start = (o: GeoPlace, d: GeoPlace) => {
+    setOrigin(o);
+    setDestination(d);
+    setRouteParams({ fromLat: o.lat, fromLon: o.lon, toLat: d.lat, toLon: d.lon });
+  };
+
+  const backToSetup = () => {
+    setScreen("setup");
+    setRouteParams(null);
+  };
+
+  return screen === "setup" ? (
+    <SetupScreen
+      onStart={(o, d) => {
+        start(o, d);
+        setScreen("game");
+      }}
+      loading={routeQ.isFetching}
+    />
+  ) : (
+    <GameScreen
+      origin={origin!}
+      destination={destination!}
+      route={routeQ.data}
+      routeError={routeQ.error}
+      loadingRoute={routeQ.isLoading}
+      onBack={backToSetup}
+    />
+  );
+}
+
+/* ═════════════════════ SETUP SCREEN ═════════════════════ */
+
+function SetupScreen({
+  onStart,
+  loading,
+}: {
+  onStart: (o: GeoPlace, d: GeoPlace) => void;
+  loading: boolean;
+}) {
+  const [origin, setOrigin] = useState<GeoPlace | null>(null);
+  const [destination, setDestination] = useState<GeoPlace | null>(null);
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
+      <div className="w-full max-w-xl space-y-6">
+        <div className="text-center space-y-2">
+          <div className="w-14 h-14 rounded-2xl bg-blue-600 flex items-center justify-center mx-auto">
+            <Car className="w-7 h-7 text-white" />
+          </div>
+          <h1 className="text-2xl font-bold">Tesla Autopilot · Simulador System One</h1>
+          <p className="text-sm text-slate-400 max-w-md mx-auto">
+            Elige un origen y un destino reales (OpenStreetMap). El Tesla recorrerá la ruta con
+            decisiones de velocidad, crucero y seguridad tomadas por TypeSafe Jev en cada instante.
+          </p>
+        </div>
+
+        <Card className="bg-slate-900/70 border-slate-800">
+          <CardContent className="p-4 space-y-3">
+            <PlaceSearch
+              label="Origen"
+              placeholder="Ej: Puerta del Sol, Madrid"
+              value={origin}
+              onChange={setOrigin}
+              icon={<MapPin className="w-4 h-4 text-emerald-400" />}
+              onUseLocation={(p) => setOrigin(p)}
+            />
+            <div className="flex justify-center">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setOrigin(destination);
+                  setDestination(origin);
+                }}
+                disabled={!origin && !destination}
+              >
+                <ArrowLeftRight className="w-4 h-4 mr-1" /> Intercambiar
+              </Button>
+            </div>
+            <PlaceSearch
+              label="Destino"
+              placeholder="Ej: Estación de Chamartín, Madrid"
+              value={destination}
+              onChange={setDestination}
+              icon={<Flag className="w-4 h-4 text-sky-400" />}
+            />
+            <Button
+              className="w-full bg-blue-600 hover:bg-blue-500"
+              disabled={!origin || !destination || loading}
+              onClick={() => origin && destination && onStart(origin, destination)}
+            >
+              {loading ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Calculando ruta…
+                </>
+              ) : (
+                <>
+                  <Play className="w-4 h-4 mr-2" /> Iniciar simulación
+                </>
+              )}
+            </Button>
+            {origin && destination && (
+              <p className="text-[11px] text-slate-500 text-center">
+                {origin.name} → {destination.name}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+
+        <div>
+          <p className="text-xs text-slate-500 mb-2 text-center">Rutas de ejemplo</p>
+          <div className="flex flex-wrap gap-2 justify-center">
+            {PRESETS.map((p) => (
+              <PresetButton
+                key={p.label}
+                label={p.label}
+                from={p.from}
+                to={p.to}
+                onResolved={(o, d) => {
+                  setOrigin(o);
+                  setDestination(d);
+                }}
+              />
+            ))}
+          </div>
+        </div>
+
+        <footer className="text-center text-[11px] text-slate-600">
+          Geocodificación Photon · Rutas OSRM · Mapa © OpenStreetMap contributors · Tiles © Esri (Maxar, Earthstar Geographics) ·
+          Decisiones: TypeSafe Jev (System One)
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function PlaceSearch({
+  label,
+  placeholder,
+  value,
+  onChange,
+  icon,
+  onUseLocation,
+}: {
+  label: string;
+  placeholder: string;
+  value: GeoPlace | null;
+  onChange: (p: GeoPlace | null) => void;
+  icon: React.ReactNode;
+  onUseLocation?: (p: GeoPlace) => void;
+}) {
+  const [text, setText] = useState(value?.name ?? "");
+  const [debounced, setDebounced] = useState("");
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(text), 300);
+    return () => clearTimeout(t);
+  }, [text]);
+
+  const q = trpc.geo.geocode.useQuery(
+    { q: debounced },
+    { enabled: debounced.trim().length > 2 && !value, staleTime: 30000 },
+  );
+
+  useEffect(() => {
+    if (value) setText(value.name);
+    else setText("");
+  }, [value]);
+
+  const locating = () => {
+    if (!onUseLocation || !navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const p: GeoPlace = {
+          id: `me:${pos.coords.latitude}:${pos.coords.longitude}`,
+          name: `Mi ubicación (${pos.coords.latitude.toFixed(5)}, ${pos.coords.longitude.toFixed(5)})`,
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+        };
+        onUseLocation(p);
+        setOpen(false);
+      },
+      () => undefined,
+      { timeout: 5000 },
+    );
+  };
+
+  return (
+    <div className="relative">
+      <div className="flex items-center gap-2">
+        {icon}
+        <div className="flex-1">
+          <label className="text-[10px] uppercase tracking-wide text-slate-500">{label}</label>
+          <div className="flex gap-1.5">
+            <Input
+              value={text}
+              placeholder={placeholder}
+              onChange={(e) => {
+                setText(e.target.value);
+                onChange(null);
+                setOpen(true);
+              }}
+              onFocus={() => setOpen(true)}
+              className="bg-slate-950 border-slate-700"
+            />
+            {onUseLocation && (
+              <Button variant="outline" size="icon" onClick={locating} title="Usar mi ubicación">
+                <LocateFixed className="w-4 h-4" />
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+      {open && !value && debounced.trim().length > 2 && (
+        <div className="absolute z-20 left-6 right-0 mt-1 rounded-md border border-slate-700 bg-slate-900 shadow-xl max-h-56 overflow-auto">
+          {q.isLoading && <p className="text-xs text-slate-400 p-3">Buscando…</p>}
+          {q.data?.length === 0 && <p className="text-xs text-slate-400 p-3">Sin resultados</p>}
+          {q.data?.map((p) => (
+            <button
+              key={p.id}
+              className="w-full text-left px-3 py-2 text-sm hover:bg-slate-800 border-b border-slate-800/60 last:border-0"
+              onClick={() => {
+                onChange(p);
+                setOpen(false);
+              }}
+            >
+              <Search className="w-3 h-3 inline mr-2 text-slate-500" />
+              {p.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PresetButton({
+  label,
+  from,
+  to,
+  onResolved,
+}: {
+  label: string;
+  from: string;
+  to: string;
+  onResolved: (o: GeoPlace, d: GeoPlace) => void;
+}) {
+  const utils = trpc.useUtils();
+  const [pending, setPending] = useState(false);
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="border-slate-700"
+      disabled={pending}
+      onClick={async () => {
+        setPending(true);
+        try {
+          const [a, b] = await Promise.all([
+            utils.geo.geocode.fetch({ q: from }),
+            utils.geo.geocode.fetch({ q: to }),
+          ]);
+          if (a[0] && b[0]) onResolved(a[0], b[0]);
+        } finally {
+          setPending(false);
+        }
+      }}
+    >
+      {pending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : label}
+    </Button>
+  );
+}
+
+/* ═════════════════════ GAME SCREEN ═════════════════════ */
+
+function GameScreen({
+  origin,
+  destination,
+  route,
+  routeError,
+  loadingRoute,
+  onBack,
+}: {
+  origin: GeoPlace;
+  destination: GeoPlace;
+  route: RouteData | undefined;
+  routeError: unknown;
+  loadingRoute: boolean;
+  onBack: () => void;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const radarRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<AutopilotGame | null>(null);
   const decideMut = trpc.ai.decide.useMutation();
   const decideRef = useRef(decideMut.mutateAsync);
@@ -60,8 +394,8 @@ export default function Home() {
   const [mode, setMode] = useState<"autopilot" | "human">("autopilot");
   const [overlay, setOverlay] = useState<TripResult | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
+  const routeMeta = route;
 
-  const tripsQ = trpc.trips.recent.useQuery({ limit: 10 });
   const saveTrip = trpc.trips.save.useMutation();
   const utils = trpc.useUtils();
 
@@ -82,28 +416,27 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (!routeMeta) return;
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = WORLD * dpr;
-    canvas.height = WORLD * dpr;
+    const radarCanvas = radarRef.current;
+    if (!canvas || !radarCanvas) return;
+    const scene = new Scene3D(canvas);
+    const radar = new Radar(radarCanvas);
 
     let lastSnapPush = 0;
-    const engine = new AutopilotGame({
+    const engine = new AutopilotGame(routeMeta, {
       onFrame: (s) => {
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          drawScene(ctx, engine.renderState());
-        }
+        const rs = engine.renderState();
+        scene.update(rs);
+        radar.update(rs);
         const now = performance.now();
         if (now - lastSnapPush > 150) {
           lastSnapPush = now;
-          setSnap(s);
+          setSnap({ ...s });
         }
       },
       onDecision: (view) => setDecision({ ...view }),
-      onLog: (entry) => setLog((prev) => [entry, ...prev].slice(0, 80)),
+      onLog: (entry) => setLog((prev) => [entry, ...prev].slice(0, 100)),
       onTripEnd: handleTripEnd,
       onError: handleError,
       requestDecision: async (state) => {
@@ -115,10 +448,12 @@ export default function Home() {
     engine.start();
     return () => {
       engine.stop();
+      scene.dispose();
+      radar.dispose();
       engineRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [routeMeta]);
 
   const toggleMode = () => {
     const next = mode === "autopilot" ? "human" : "autopilot";
@@ -126,39 +461,55 @@ export default function Home() {
     engineRef.current?.setMode(next);
   };
 
-  const humanDecide = (speed: SpeedAction, dir: Direction) => {
-    engineRef.current?.applyHumanDecision(speed, dir);
+  const humanDecide = (speed: SpeedAction, cruise: CruiseChoice) => {
+    engineRef.current?.applyHumanDecision(speed, cruise);
   };
 
   const restart = () => {
-    engineRef.current?.reset();
     setOverlay(null);
     setLog([]);
     setDecision(null);
+    onBack();
   };
 
-  const resp = decision?.response ?? null;
-  const speedAns = resp?.answers.speed_action ?? null;
-  const dirAns = resp?.answers.next_direction ?? null;
+  if (loadingRoute || !routeMeta) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-8 h-8 animate-spin text-blue-400" />
+          <p className="text-sm text-slate-400">Calculando la ruta…</p>
+          {routeError ? (
+            <p className="text-sm text-red-400 max-w-md text-center">
+              {routeError instanceof Error ? routeError.message : "Error obteniendo la ruta"}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  const etaS =
+    snap && routeMeta.distanceM > 0
+      ? Math.round((snap.remainingM / routeMeta.distanceM) * routeMeta.durationS)
+      : null;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-6">
-      <div className="max-w-[1400px] mx-auto flex flex-col gap-4">
+      <div className="max-w-[1500px] mx-auto flex flex-col gap-4">
         {/* Header */}
         <header className="flex flex-wrap items-center gap-3 justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center">
-              <Brain className="w-5 h-5 text-white" />
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center shrink-0">
+              <Navigation className="w-5 h-5 text-white" />
             </div>
-            <div>
-              <h1 className="text-lg font-bold leading-tight">Tesla Autopilot · Simulador System One</h1>
+            <div className="min-w-0">
+              <h1 className="text-lg font-bold leading-tight truncate">
+                {origin.name.split(",")[0]} → {destination.name.split(",")[0]}
+              </h1>
               <p className="text-xs text-slate-400">
-                Decisiones de velocidad y dirección en tiempo real con TypeSafe Jev
+                {(routeMeta.distanceM / 1000).toFixed(1)} km · decisiones en tiempo real con TypeSafe Jev
               </p>
             </div>
-            <Badge variant="outline" className="border-blue-500/40 text-blue-300 ml-2">
-              jev-latest · choice + noul
-            </Badge>
           </div>
           <div className="flex items-center gap-2">
             <StatusPill status={snap?.status ?? "running"} thinking={decision?.pending} />
@@ -176,10 +527,10 @@ export default function Home() {
               onClick={() => engineRef.current?.endTrip()}
               disabled={overlay !== null}
             >
-              <Square className="w-3.5 h-3.5 mr-1" /> Terminar viaje
+              <Square className="w-3.5 h-3.5 mr-1" /> Terminar
             </Button>
             <Button variant="outline" size="sm" onClick={restart}>
-              <RotateCcw className="w-3.5 h-3.5 mr-1" /> Reiniciar
+              <RotateCcw className="w-3.5 h-3.5 mr-1" /> Nueva ruta
             </Button>
           </div>
         </header>
@@ -191,182 +542,255 @@ export default function Home() {
           </div>
         )}
 
-        {/* Main */}
-        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_430px] gap-4">
+        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_400px] gap-4">
           {/* Canvas column */}
           <div className="flex flex-col gap-3">
             <Card className="bg-slate-900/60 border-slate-800 overflow-hidden">
               <CardContent className="p-3 relative">
-                <div className="relative mx-auto" style={{ maxWidth: 720 }}>
-                  <canvas
-                    ref={canvasRef}
-                    className="w-full h-auto rounded-md block"
-                    style={{ aspectRatio: "1 / 1" }}
-                  />
-                  {overlay && (
-                    <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center rounded-md">
-                      <div className="text-center space-y-3 px-6">
-                        {overlay.crashed ? (
-                          <>
-                            <AlertTriangle className="w-12 h-12 text-red-400 mx-auto" />
-                            <h2 className="text-2xl font-bold text-red-400">Accidente</h2>
-                            <p className="text-sm text-slate-300">
-                              El Tesla chocó. El viaje ha terminado.
-                            </p>
-                          </>
-                        ) : (
-                          <>
-                            <Flag className="w-12 h-12 text-emerald-400 mx-auto" />
-                            <h2 className="text-2xl font-bold text-emerald-400">Viaje finalizado</h2>
-                          </>
-                        )}
-                        <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-sm text-slate-300 text-left">
-                          <span>Puntuación</span>
-                          <span className="font-mono text-right">{overlay.score}</span>
-                          <span>Distancia</span>
-                          <span className="font-mono text-right">{overlay.distanceM} m</span>
-                          <span>Duración</span>
-                          <span className="font-mono text-right">{overlay.durationS} s</span>
-                          <span>Decisiones de Jev</span>
-                          <span className="font-mono text-right">{overlay.decisions}</span>
-                          <span>Destinos alcanzados</span>
-                          <span className="font-mono text-right">{overlay.destinationsReached}</span>
-                          <span>Incidentes</span>
-                          <span className="font-mono text-right">{overlay.incidents}</span>
-                        </div>
-                        <Button onClick={restart} className="bg-blue-600 hover:bg-blue-500">
-                          <Play className="w-4 h-4 mr-1" /> Nuevo viaje
-                        </Button>
+                <canvas ref={canvasRef} className="w-full block rounded-md bg-[#05070d]" />
+                {/* GPS radar ball, bottom-right (GTA style) */}
+                <div className="absolute bottom-3 right-3 rounded-full shadow-[0_0_30px_rgba(0,0,0,0.6)]">
+                  <canvas ref={radarRef} className="block rounded-full" />
+                </div>
+                {overlay && (
+                  <div className="absolute inset-3 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center rounded-md">
+                    <div className="text-center space-y-3 px-6">
+                      {overlay.crashed ? (
+                        <>
+                          <AlertTriangle className="w-12 h-12 text-red-400 mx-auto" />
+                          <h2 className="text-2xl font-bold text-red-400">Accidente</h2>
+                          <p className="text-sm text-slate-300">El viaje ha terminado.</p>
+                        </>
+                      ) : (
+                        <>
+                          <Flag className="w-12 h-12 text-emerald-400 mx-auto" />
+                          <h2 className="text-2xl font-bold text-emerald-400">¡Has llegado!</h2>
+                        </>
+                      )}
+                      <div className="grid grid-cols-2 gap-x-8 gap-y-1 text-sm text-slate-300 text-left">
+                        <span>Puntuación</span>
+                        <span className="font-mono text-right">{overlay.score}</span>
+                        <span>Distancia</span>
+                        <span className="font-mono text-right">{overlay.distanceM} m</span>
+                        <span>Duración</span>
+                        <span className="font-mono text-right">{overlay.durationS} s</span>
+                        <span>Decisiones de Jev</span>
+                        <span className="font-mono text-right">{overlay.decisions}</span>
+                        <span>Maniobras completadas</span>
+                        <span className="font-mono text-right">{overlay.destinationsReached}</span>
+                        <span>Incidentes</span>
+                        <span className="font-mono text-right">{overlay.incidents}</span>
                       </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* HUD */}
-                <div className="mt-3 grid grid-cols-3 sm:grid-cols-6 gap-2">
-                  <Hud label="Velocidad" value={`${snap?.speedKmh ?? 0}`} unit="km/h" accent />
-                  <Hud label="Límite" value={`${snap?.speedLimitKmh ?? "-"}`} unit="km/h" />
-                  <Hud label="Puntuación" value={`${snap?.score ?? 0}`} />
-                  <Hud label="Distancia" value={`${snap?.distanceM ?? 0}`} unit="m" />
-                  <Hud label="Destinos" value={`${snap?.destinationsReached ?? 0}`} />
-                  <Hud
-                    label="Incidentes"
-                    value={`${snap?.incidents ?? 0}`}
-                    warn={(snap?.incidents ?? 0) > 0}
-                  />
-                </div>
-
-                {/* Human controls */}
-                {mode === "human" && (
-                  <div className="mt-3 rounded-md border border-slate-700 bg-slate-900 p-3">
-                    <p className="text-xs text-slate-400 mb-2">
-                      Piloto humano: cada ciclo Jev da su recomendación (panel derecho), pero tú tienes
-                      la última palabra. Sin pulsar, el Tesla mantiene su última orden.
-                    </p>
-                    <div className="flex flex-wrap gap-2">
-                      <HumanBtn
-                        active={false}
-                        onClick={() => humanDecide("accelerate", snap?.latchedTurn ?? "straight")}
-                        icon={<ArrowUp className="w-4 h-4" />}
-                        label="Acelerar"
-                        suggest={speedAns?.choice === "accelerate"}
-                      />
-                      <HumanBtn
-                        active={false}
-                        onClick={() => humanDecide("maintain", snap?.latchedTurn ?? "straight")}
-                        icon={<Minus className="w-4 h-4" />}
-                        label="Mantener"
-                        suggest={speedAns?.choice === "maintain"}
-                      />
-                      <HumanBtn
-                        active={false}
-                        onClick={() => humanDecide("brake", snap?.latchedTurn ?? "straight")}
-                        icon={<ArrowDown className="w-4 h-4" />}
-                        label="Frenar"
-                        suggest={speedAns?.choice === "brake"}
-                      />
-                      <Separator orientation="vertical" className="h-8 bg-slate-700" />
-                      <HumanBtn
-                        active={false}
-                        onClick={() => humanDecide("accelerate", "straight")}
-                        icon={<ArrowUpIcon className="w-4 h-4" />}
-                        label="Recto"
-                        suggest={dirAns?.choice === "straight"}
-                      />
-                      <HumanBtn
-                        active={false}
-                        onClick={() => humanDecide("accelerate", "left")}
-                        icon={<ChevronLeft className="w-4 h-4" />}
-                        label="Izquierda"
-                        suggest={dirAns?.choice === "left"}
-                      />
-                      <HumanBtn
-                        active={false}
-                        onClick={() => humanDecide("accelerate", "right")}
-                        icon={<ChevronRight className="w-4 h-4" />}
-                        label="Derecha"
-                        suggest={dirAns?.choice === "right"}
-                      />
+                      <Button onClick={restart} className="bg-blue-600 hover:bg-blue-500">
+                        <Play className="w-4 h-4 mr-1" /> Nueva ruta
+                      </Button>
                     </div>
                   </div>
                 )}
+                {/* speed-limit sign overlay */}
+                <div className="absolute top-5 right-5 flex flex-col items-center gap-1.5">
+                  <div className="w-12 h-12 rounded-full border-4 border-white bg-slate-950 flex items-center justify-center shadow-lg">
+                    <span className="text-lg font-bold font-mono">{snap?.speedLimitKmh ?? "-"}</span>
+                  </div>
+                  <span className="text-[9px] uppercase tracking-wide text-slate-400 bg-slate-950/70 px-1.5 rounded">
+                    límite
+                  </span>
+                  {snap?.cruiseActive && (
+                    <Badge className="bg-emerald-600/90 hover:bg-emerald-600 text-[10px]">
+                      CRUCERO {snap.cruiseTargetKmh}
+                    </Badge>
+                  )}
+                </div>
               </CardContent>
             </Card>
+
+            {/* HUD */}
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+              <Hud label="Velocidad" value={`${snap?.speedKmh ?? 0}`} unit="km/h" accent />
+              <Hud label="Progreso" value={`${snap?.progressPct ?? 0}`} unit="%" />
+              <Hud
+                label="Restante"
+                value={
+                  snap
+                    ? snap.remainingM > 1000
+                      ? `${(snap.remainingM / 1000).toFixed(1)}`
+                      : `${snap.remainingM}`
+                    : "-"
+                }
+                unit={snap && snap.remainingM > 1000 ? "km" : "m"}
+              />
+              <Hud label="Maniobra en" value={`${snap?.nextManeuver ? Math.round(snap.nextManeuver.distanceM) : "-"}`} unit="m" />
+              <Hud label="Decisiones" value={`${snap?.decisions ?? 0}`} />
+              <Hud label="Incidentes" value={`${snap?.incidents ?? 0}`} warn={(snap?.incidents ?? 0) > 0} />
+            </div>
+
+            {/* Human controls */}
+            {mode === "human" && (
+              <div className="rounded-md border border-slate-700 bg-slate-900 p-3">
+                <p className="text-xs text-slate-400 mb-2">
+                  Piloto humano: Jev sigue recomendando (panel derecho), pero tus botones prevalecen.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <HumanBtn
+                    onClick={() => humanDecide("accelerate", "off")}
+                    icon={<ArrowUp className="w-4 h-4" />}
+                    label="Acelerar"
+                    suggest={decision?.response?.answers.speed_action.choice === "accelerate"}
+                  />
+                  <HumanBtn
+                    onClick={() => humanDecide("maintain", "off")}
+                    icon={<Minus className="w-4 h-4" />}
+                    label="Mantener"
+                    suggest={decision?.response?.answers.speed_action.choice === "maintain"}
+                  />
+                  <HumanBtn
+                    onClick={() => humanDecide("brake", "off")}
+                    icon={<ArrowDown className="w-4 h-4" />}
+                    label="Frenar"
+                    suggest={decision?.response?.answers.speed_action.choice === "brake"}
+                  />
+                  <Separator orientation="vertical" className="h-8 bg-slate-700" />
+                  {(["cruise_80", "cruise_100", "cruise_120", "off"] as CruiseChoice[]).map((c) => (
+                    <HumanBtn
+                      key={c}
+                      onClick={() => humanDecide("maintain", c)}
+                      icon={<Gauge className="w-4 h-4" />}
+                      label={CRUISE_LABEL[c]}
+                      suggest={decision?.response?.answers.cruise.choice === c}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Panels column */}
-          <Card className="bg-slate-900/60 border-slate-800 flex flex-col min-h-[640px]">
-            <Tabs defaultValue="decision" className="flex flex-col flex-1">
-              <CardHeader className="pb-2">
-                <TabsList className="grid grid-cols-5 bg-slate-800/70">
-                  <TabsTrigger value="decision">
-                    <Brain className="w-3.5 h-3.5 mr-1 hidden sm:inline" />Decisión
-                  </TabsTrigger>
-                  <TabsTrigger value="perception">
-                    <Eye className="w-3.5 h-3.5 mr-1 hidden sm:inline" />Percepción
-                  </TabsTrigger>
-                  <TabsTrigger value="log">
-                    <ListOrdered className="w-3.5 h-3.5 mr-1 hidden sm:inline" />Registro
-                  </TabsTrigger>
-                  <TabsTrigger value="trips">
-                    <Database className="w-3.5 h-3.5 mr-1 hidden sm:inline" />Viajes
-                  </TabsTrigger>
-                  <TabsTrigger value="api">
-                    <Braces className="w-3.5 h-3.5 mr-1 hidden sm:inline" />API
-                  </TabsTrigger>
-                </TabsList>
-              </CardHeader>
-              <CardContent className="flex-1 overflow-hidden">
-                <TabsContent value="decision" className="h-full m-0">
-                  <DecisionTab decision={decision} latched={snap?.latchedTurn ?? null} />
-                </TabsContent>
-                <TabsContent value="perception" className="h-full m-0">
-                  <PerceptionTab decision={decision} snap={snap} />
-                </TabsContent>
-                <TabsContent value="log" className="h-full m-0">
-                  <LogTab log={log} />
-                </TabsContent>
-                <TabsContent value="trips" className="h-full m-0">
-                  <TripsTab trips={tripsQ.data ?? []} loading={tripsQ.isLoading} />
-                </TabsContent>
-                <TabsContent value="api" className="h-full m-0">
-                  <ApiTab decision={decision} />
-                </TabsContent>
-              </CardContent>
-            </Tabs>
-          </Card>
+          {/* Right column: GPS + tabs */}
+          <div className="flex flex-col gap-4">
+            <GpsCard snap={snap} etaS={etaS} fromName={origin.name} toName={destination.name} />
+            <Card className="bg-slate-900/60 border-slate-800 flex flex-col min-h-[420px]">
+              <Tabs defaultValue="decision" className="flex flex-col flex-1">
+                <CardHeader className="pb-2">
+                  <TabsList className="grid grid-cols-3 bg-slate-800/70">
+                    <TabsTrigger value="decision">
+                      <Brain className="w-3.5 h-3.5 mr-1 hidden sm:inline" />Decisión
+                    </TabsTrigger>
+                    <TabsTrigger value="log">
+                      <ListOrdered className="w-3.5 h-3.5 mr-1 hidden sm:inline" />Registro
+                    </TabsTrigger>
+                    <TabsTrigger value="api">
+                      <Braces className="w-3.5 h-3.5 mr-1 hidden sm:inline" />API
+                    </TabsTrigger>
+                  </TabsList>
+                </CardHeader>
+                <CardContent className="flex-1 overflow-hidden">
+                  <TabsContent value="decision" className="h-full m-0">
+                    <DecisionTab decision={decision} />
+                  </TabsContent>
+                  <TabsContent value="log" className="h-full m-0">
+                    <LogTab log={log} />
+                  </TabsContent>
+                  <TabsContent value="api" className="h-full m-0">
+                    <ApiTab decision={decision} />
+                  </TabsContent>
+                </CardContent>
+              </Tabs>
+            </Card>
+          </div>
         </div>
 
-        <footer className="text-center text-xs text-slate-500">
-          Decisiones tipadas (choice · noul) vía POST /v1/systemone de TypeSafe AI · El estado que
-          percibe el Tesla se envía cada ~0,9 s · La clave de API solo existe en el servidor
+        <footer className="text-center text-[11px] text-slate-600">
+          Mapa © OpenStreetMap contributors · Tiles © Esri (Maxar, Earthstar Geographics) · Rutas OSRM · Geocodificación Photon ·
+          Decisiones tipadas (choice · noul) vía TypeSafe System One — la clave solo existe en el servidor
         </footer>
       </div>
     </div>
   );
 }
 
-/* ── small components ─────────────────────────────────────────── */
+/* ── GPS card ─────────────────────────────────────────────────── */
+
+function maneuverIcon(type: string, modifier: string): React.ReactNode {
+  if (type === "arrive") return <Flag className="w-6 h-6" />;
+  if (type.includes("roundabout")) return <RefreshCw className="w-6 h-6" />;
+  if (type === "merge") return <Merge className="w-6 h-6" />;
+  if (modifier.includes("left") && !modifier.includes("slight"))
+    return <CornerUpLeft className="w-6 h-6" />;
+  if (modifier.includes("right") && !modifier.includes("slight"))
+    return <CornerUpRight className="w-6 h-6" />;
+  return <ArrowUp className="w-6 h-6" />;
+}
+
+function GpsCard({
+  snap,
+  etaS,
+  fromName,
+  toName,
+}: {
+  snap: Snapshot | null;
+  etaS: number | null;
+  fromName: string;
+  toName: string;
+}) {
+  const man = snap?.nextManeuver ?? null;
+  return (
+    <Card className="bg-slate-900/70 border-slate-800">
+      <CardContent className="p-4 space-y-3">
+        <div className="flex items-start gap-3">
+          <div className="w-12 h-12 rounded-xl bg-blue-600/20 border border-blue-500/40 flex items-center justify-center text-blue-300 shrink-0">
+            {man ? maneuverIcon(man.type, man.modifier) : <Navigation className="w-6 h-6" />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-[10px] uppercase tracking-wide text-slate-500">
+              {man ? `En ${Math.round(man.distanceM)} m` : "GPS"}
+            </div>
+            <div className="text-base font-semibold leading-snug">
+              {man?.instruction ?? "Continúa hacia el destino"}
+            </div>
+            <div className="text-xs text-slate-400 truncate">
+              {snap?.roadName || "—"}
+              {snap?.afterNext ? ` · luego: ${snap.afterNext}` : ""}
+            </div>
+          </div>
+        </div>
+        <div>
+          <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-blue-500 to-emerald-400 transition-all duration-300"
+              style={{ width: `${snap?.progressPct ?? 0}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-[11px] text-slate-500 mt-1">
+            <span className="truncate max-w-[45%]">{fromName.split(",")[0]}</span>
+            <span>
+              {snap ? `${snap.progressPct}%` : "—"}
+              {etaS !== null && ` · ETA ${Math.floor(etaS / 60)}:${String(etaS % 60).padStart(2, "0")}`}
+            </span>
+            <span className="truncate max-w-[45%] text-right">{toName.split(",")[0]}</span>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge variant="outline" className="border-slate-600 text-slate-300">
+            <Gauge className="w-3 h-3 mr-1" /> límite {snap?.speedLimitKmh ?? "-"} km/h
+          </Badge>
+          {snap?.cruiseActive ? (
+            <Badge className="bg-emerald-600/90 hover:bg-emerald-600">
+              crucero {snap.cruiseTargetKmh} km/h
+            </Badge>
+          ) : (
+            <Badge variant="outline" className="border-slate-700 text-slate-500">
+              crucero off
+            </Badge>
+          )}
+          {snap?.emergency && (
+            <Badge className="bg-red-600/90 hover:bg-red-600">frenada de emergencia</Badge>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ── shared bits ──────────────────────────────────────────────── */
 
 function StatusPill({ status, thinking }: { status: string; thinking?: boolean }) {
   const map: Record<string, { text: string; cls: string }> = {
@@ -378,18 +802,11 @@ function StatusPill({ status, thinking }: { status: string; thinking?: boolean }
   const s = thinking ? map.thinking : map[status] ?? map.running;
   return (
     <Badge variant="outline" className={s.cls}>
-      <span className="relative flex h-2 w-2 mr-1.5">
-        <span
-          className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-60 ${
-            status === "error" ? "bg-red-400" : "bg-emerald-400"
-          }`}
-        />
-        <span
-          className={`relative inline-flex rounded-full h-2 w-2 ${
-            status === "error" ? "bg-red-400" : "bg-emerald-400"
-          }`}
-        />
-      </span>
+      <span
+        className={`relative flex h-2 w-2 mr-1.5 rounded-full ${
+          status === "error" ? "bg-red-400" : "bg-emerald-400"
+        } ${thinking ? "animate-pulse" : ""}`}
+      />
       {s.text}
     </Badge>
   );
@@ -436,7 +853,6 @@ function HumanBtn({
   onClick: () => void;
   icon: React.ReactNode;
   label: string;
-  active?: boolean;
   suggest?: boolean;
 }) {
   return (
@@ -445,7 +861,9 @@ function HumanBtn({
       variant="secondary"
       onClick={onClick}
       className={`gap-1.5 ${
-        suggest ? "ring-2 ring-blue-500/70 bg-blue-950/60 hover:bg-blue-900/60" : "bg-slate-800 hover:bg-slate-700"
+        suggest
+          ? "ring-2 ring-blue-500/70 bg-blue-950/60 hover:bg-blue-900/60"
+          : "bg-slate-800 hover:bg-slate-700"
       }`}
     >
       {icon}
@@ -473,13 +891,7 @@ function ProbBar({ label, prob, chosen }: { label: string; prob: number; chosen:
   );
 }
 
-function DecisionTab({
-  decision,
-  latched,
-}: {
-  decision: DecisionView | null;
-  latched: Direction | null;
-}) {
+function DecisionTab({ decision }: { decision: DecisionView | null }) {
   if (!decision) {
     return <p className="text-sm text-slate-400 pt-4">Esperando al primer ciclo de decisión…</p>;
   }
@@ -489,16 +901,23 @@ function DecisionTab({
       <div className="flex flex-col items-center gap-2 pt-10 text-slate-400">
         <Brain className="w-8 h-8 animate-pulse text-blue-400" />
         <p className="text-sm">Preguntando a Jev qué hacer ahora…</p>
-        <p className="text-xs text-slate-500">tick #{decision.tick} · velocidad + dirección + peligro</p>
+        <p className="text-xs text-slate-500">tick #{decision.tick} · velocidad · crucero · maniobra · peligro</p>
       </div>
     );
   }
   const s = resp.answers.speed_action;
-  const d = resp.answers.next_direction;
+  const c = resp.answers.cruise;
   const danger = resp.answers.immediate_danger.noul;
+  const manSafe = resp.answers.maneuver_ok.noul;
+  const p = decision.perception;
   return (
-    <ScrollArea className="h-[560px] pr-3">
+    <ScrollArea className="h-[430px] pr-3">
       <div className="space-y-4">
+        <div className="rounded-md border border-slate-800 bg-slate-900/60 px-3 py-2 text-xs text-slate-400">
+          <span className="text-slate-200 font-medium">Viendo:</span> {p.traffic.laneAhead} · límite{" "}
+          {p.gps.speedLimitKmh} km/h · próxima maniobra en {p.gps.distanceToManeuverM} m (
+          {p.gps.nextManeuver})
+        </div>
         <div>
           <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
             ¿Cómo ajusta la velocidad?
@@ -513,32 +932,39 @@ function DecisionTab({
         </div>
         <div>
           <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
-            ¿Hacia dónde en el próximo cruce?
+            ¿Crucero adaptativo?
           </h3>
           <div className="space-y-1.5">
-            {Object.entries(d.probabilities)
+            {Object.entries(c.probabilities)
               .sort((a, b) => b[1] - a[1])
               .map(([k, v]) => (
-                <ProbBar
-                  key={k}
-                  label={DIR_LABEL[k as Direction] ?? k}
-                  prob={v}
-                  chosen={(latched ?? d.choice) === k}
-                />
+                <ProbBar key={k} label={CRUISE_LABEL[k] ?? k} prob={v} chosen={c.choice === k} />
               ))}
           </div>
-          <p className="text-[11px] text-slate-500 mt-1.5">
-            Giro actualmente activado:{" "}
-            <span className="text-blue-300">{DIR_LABEL[latched ?? (d.choice as Direction)]}</span>
-          </p>
+          {CRUISE_VALUE[c.choice] !== null && p.gps.fastRoad === false && (
+            <p className="text-[11px] text-amber-400 mt-1.5">
+              Jev propone crucero pero la vía no es rápida (límite {p.gps.speedLimitKmh}) → se ignora
+            </p>
+          )}
         </div>
-        <div>
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
-            ¿Peligro inminente?
-          </h3>
+        <div className="grid grid-cols-2 gap-2">
           <div className="rounded-md border border-slate-800 px-3 py-2.5">
             <div className="flex justify-between text-xs mb-1.5">
-              <span className="text-slate-300">Probabilidad de colisión inminente</span>
+              <span className="text-slate-300">Maniobra segura</span>
+              <span className="font-mono">{Math.round(manSafe * 100)}%</span>
+            </div>
+            <div className="relative h-2 rounded-full bg-slate-800 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ${manSafe < 0.4 ? "bg-amber-500" : "bg-emerald-500"}`}
+                style={{ width: `${Math.max(Math.round(manSafe * 100), 2)}%` }}
+              />
+              <div className="absolute top-0 bottom-0 w-px bg-white/50" style={{ left: "40%" }} />
+            </div>
+            <p className="text-[10px] text-slate-500 mt-1">&lt; 40% frena para la maniobra</p>
+          </div>
+          <div className="rounded-md border border-slate-800 px-3 py-2.5">
+            <div className="flex justify-between text-xs mb-1.5">
+              <span className="text-slate-300">Peligro inminente</span>
               <span className="font-mono">{Math.round(danger * 100)}%</span>
             </div>
             <div className="relative h-2 rounded-full bg-slate-800 overflow-hidden">
@@ -548,9 +974,7 @@ function DecisionTab({
               />
               <div className="absolute top-0 bottom-0 w-px bg-white/50" style={{ left: "55%" }} />
             </div>
-            <p className="text-[10px] text-slate-500 mt-1">
-              ≥ 55% dispara la frenada de emergencia automática
-            </p>
+            <p className="text-[10px] text-slate-500 mt-1">≥ 55% frena en emergencia</p>
           </div>
         </div>
         <Separator className="bg-slate-800" />
@@ -571,70 +995,11 @@ function DecisionTab({
         <p className="text-[11px] text-slate-500">
           Modelo: <span className="font-mono text-slate-300">{resp.model}</span>
           {decision.mode === "human" && (
-            <>
-              {" "}· Modo humano: esta es la recomendación de Jev; el botón que pulses prevalece.
-              {decision.humanApplied && (
-                <span className="text-blue-300"> Última orden aplicada por ti.</span>
-              )}
-            </>
+            <span className="text-blue-300">
+              {" "}· Modo humano{decision.humanApplied ? " · última orden aplicada por ti" : ""}
+            </span>
           )}
         </p>
-      </div>
-    </ScrollArea>
-  );
-}
-
-function PerceptionTab({ decision, snap }: { decision: DecisionView | null; snap: Snapshot | null }) {
-  if (!decision) return <p className="text-sm text-slate-400 pt-4">Sin percepción todavía…</p>;
-  const p = decision.perception;
-  const rows: Array<[string, string]> = [
-    ["Velocidad actual", `${p.autopilot.speedKmh} km/h (límite ${p.autopilot.speedLimitKmh})`],
-    ["Dirección actual", HEADING_LABEL[p.autopilot.heading]],
-    ["Distancia al próximo cruce", `${p.autopilot.distanceToIntersectionM} m`],
-    [
-      "Direcciones válidas en el cruce",
-      p.autopilot.availableDirections.map((d) => DIR_LABEL[d]).join(" · ") || "solo girar en U",
-    ],
-    ["Destino", p.autopilot.destinationRelative],
-    ["Ruta sugerida por código", `en el cruce, ${DIR_LABEL[p.autopilot.destinationHint]}`],
-    ["Calzada", p.perception.laneAhead],
-  ];
-  if (p.perception.vehicleAhead) {
-    rows.push([
-      "Vehículo delante",
-      `${p.perception.vehicleAhead.type} a ${p.perception.vehicleAhead.distanceM} m · ${p.perception.vehicleAhead.speedKmh} km/h`,
-    ]);
-  }
-  if (p.perception.oncomingVehicle) {
-    rows.push([
-      "Sentido contrario",
-      `a ${p.perception.oncomingVehicle.distanceM} m · ${p.perception.oncomingVehicle.speedKmh} km/h`,
-    ]);
-  }
-  if (p.perception.pedestrian) {
-    rows.push(["Peatón", `cruzando el próximo cruce, a ${p.perception.pedestrian.distanceM} m`]);
-  }
-  return (
-    <ScrollArea className="h-[560px] pr-3">
-      <div className="space-y-4">
-        <p className="text-xs text-slate-400">
-          Estado estructurado que el simulador envía a Jev en cada ciclo (tick #{p.tick}). Jev no
-          genera texto: responde con decisiones tipadas sobre este estado.
-        </p>
-        <div className="space-y-1.5">
-          {rows.map(([k, v]) => (
-            <div key={k} className="flex justify-between gap-3 text-sm rounded-md bg-slate-900/70 border border-slate-800 px-3 py-2">
-              <span className="text-slate-400 shrink-0">{k}</span>
-              <span className="text-slate-100 text-right">{v}</span>
-            </div>
-          ))}
-        </div>
-        {snap && (
-          <p className="text-[11px] text-slate-500">
-            Decisiones tomadas hasta ahora: {snap.decisions} · el coche mantiene el giro activado:{" "}
-            {snap.latchedTurn ? DIR_LABEL[snap.latchedTurn] : "recto"}
-          </p>
-        )}
       </div>
     </ScrollArea>
   );
@@ -644,7 +1009,7 @@ function LogTab({ log }: { log: DecisionLogEntry[] }) {
   if (log.length === 0)
     return <p className="text-sm text-slate-400 pt-4">Aún no hay decisiones registradas.</p>;
   return (
-    <ScrollArea className="h-[560px] pr-3">
+    <ScrollArea className="h-[430px] pr-3">
       <div className="space-y-1.5">
         {log.map((e, idx) => (
           <div
@@ -664,11 +1029,21 @@ function LogTab({ log }: { log: DecisionLogEntry[] }) {
             >
               {SPEED_LABEL[e.speedAction]}
             </Badge>
-            <Badge variant="outline" className="border-slate-600 text-slate-300">
-              {DIR_LABEL[e.direction]}
+            <Badge
+              variant="outline"
+              className={
+                e.cruise === "off"
+                  ? "border-slate-700 text-slate-500"
+                  : "border-emerald-500/40 text-emerald-300"
+              }
+            >
+              {CRUISE_LABEL[e.cruise].replace("Crucero ", "C")}
             </Badge>
             <span className={`font-mono ${e.danger >= 0.55 ? "text-red-400" : "text-slate-400"}`}>
-              ⚠ {Math.round(e.danger * 100)}%
+              ⚠{Math.round(e.danger * 100)}%
+            </span>
+            <span className={`font-mono ${e.maneuverSafe < 0.4 ? "text-amber-400" : "text-slate-500"}`}>
+              ↪{Math.round(e.maneuverSafe * 100)}%
             </span>
             <span className="ml-auto font-mono text-slate-500">{e.latencyMs} ms</span>
             <span className={`font-mono ${e.source === "human" ? "text-blue-300" : "text-slate-500"}`}>
@@ -681,54 +1056,12 @@ function LogTab({ log }: { log: DecisionLogEntry[] }) {
   );
 }
 
-function TripsTab({ trips, loading }: { trips: any[]; loading: boolean }) {
-  if (loading) return <p className="text-sm text-slate-400 pt-4">Cargando viajes…</p>;
-  if (trips.length === 0)
-    return (
-      <p className="text-sm text-slate-400 pt-4">
-        Todavía no hay viajes guardados. Termina un viaje (o choca) para registrarlo aquí. Se
-        guardan en la base de datos del servidor.
-      </p>
-    );
-  return (
-    <ScrollArea className="h-[560px] pr-3">
-      <div className="space-y-1.5">
-        {trips.map((t) => (
-          <div
-            key={t.id}
-            className="flex items-center gap-3 text-xs rounded-md bg-slate-900/70 border border-slate-800 px-3 py-2"
-          >
-            <span className={`font-mono font-bold ${t.crashed === "yes" ? "text-red-400" : "text-emerald-300"}`}>
-              {t.score}
-            </span>
-            <span className="text-slate-400">
-              {t.distanceM} m · {t.durationS} s
-            </span>
-            <span className="text-slate-500">
-              {t.destinationsReached} dest. · {t.decisions} decisiones
-            </span>
-            {t.crashed === "yes" && <AlertTriangle className="w-3.5 h-3.5 text-red-400" />}
-            <span className="ml-auto text-slate-500">
-              {new Date(t.createdAt).toLocaleString("es-ES", {
-                day: "2-digit",
-                month: "2-digit",
-                hour: "2-digit",
-                minute: "2-digit",
-              })}
-            </span>
-          </div>
-        ))}
-      </div>
-    </ScrollArea>
-  );
-}
-
 function ApiTab({ decision }: { decision: DecisionView | null }) {
   const request = decision
-    ? { model: "jev-latest", state: decision.rawState, questions: DECISION_QUESTIONS }
+    ? { model: "jev-latest", state: decision.perception, questions: DECISION_QUESTIONS }
     : null;
   return (
-    <ScrollArea className="h-[560px] pr-3">
+    <ScrollArea className="h-[430px] pr-3">
       <div className="space-y-3">
         <p className="text-xs text-slate-400">
           Petición real enviada por el servidor proxy (la clave nunca sale del servidor) y respuesta
@@ -736,9 +1069,9 @@ function ApiTab({ decision }: { decision: DecisionView | null }) {
         </p>
         <div>
           <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1.5">
-            → Request
+            → Request (estado GPS + tráfico)
           </h3>
-          <pre className="text-[11px] font-mono rounded-md bg-black/50 border border-slate-800 p-3 overflow-auto max-h-64">
+          <pre className="text-[11px] font-mono rounded-md bg-black/50 border border-slate-800 p-3 overflow-auto max-h-72">
             {request ? JSON.stringify(request, null, 2) : "…"}
           </pre>
         </div>
@@ -746,7 +1079,7 @@ function ApiTab({ decision }: { decision: DecisionView | null }) {
           <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1.5">
             ← Response
           </h3>
-          <pre className="text-[11px] font-mono rounded-md bg-black/50 border border-slate-800 p-3 overflow-auto max-h-64">
+          <pre className="text-[11px] font-mono rounded-md bg-black/50 border border-slate-800 p-3 overflow-auto max-h-72">
             {decision?.response ? JSON.stringify(decision.response, null, 2) : "…"}
           </pre>
         </div>

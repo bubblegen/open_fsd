@@ -1,74 +1,81 @@
-import type {
-  DecideResponse,
-  Direction,
-  Heading,
-  PerceptionState,
-  SpeedAction,
-} from "@contracts/ai";
+import type { DecideResponse, PerceptionState, SpeedAction, CruiseChoice } from "@contracts/ai";
+import type { RouteData } from "@contracts/geo";
+import {
+  Polyline,
+  createProjection,
+  stepsWithS,
+  limitForStep,
+  instructionFor,
+  type Projection,
+} from "./geo";
 
 /* ────────────────────────────────────────────────────────────────
    Constants
 ──────────────────────────────────────────────────────────────── */
 
-export const GRID = 7; // 7x7 intersections → 6x6 blocks
-export const SPACING = 118; // px between intersections
-export const WORLD = (GRID - 1) * SPACING; // 708 px
-export const ROAD_W = 46;
-export const PX_PER_M = 3; // 3 px = 1 m
-export const EDGE_M = SPACING / PX_PER_M; // ~39.3 m per block
-export const CAR_LEN = 26;
-export const CAR_W = 14;
-
 const DECISION_INTERVAL_S = 0.9;
-const MAX_SPEED = 90; // km/h
-const ACCEL = 7; // km/h per second
-const BRAKE = 20;
-const EMERGENCY_BRAKE = 34;
-const DRAG = 0.8;
+const MAX_SPEED = 130;
+const ACCEL = 9; // km/h per second
+const BRAKE = 30;
+const EMERGENCY_BRAKE = 40;
+const DRAG = 1;
 const DANGER_THRESHOLD = 0.55;
-const HARD_BRAKE_INCIDENT = 26; // km/h per second — only true emergency braking counts
+const FIXED_STEP_S = 0.05;
+const MAX_CATCHUP_S = 2.0;
+const MANEUVER_SAFE_THRESHOLD = 0.4;
+const HARD_BRAKE_INCIDENT = 34; // above BRAKE (30): only true emergency braking counts
+const LANE = 1.9; // meters, right-hand traffic
+const CAR_LEN_M = 4.6;
+const ARRIVE_WINDOW_M = 12;
 
 /* ────────────────────────────────────────────────────────────────
    Types
 ──────────────────────────────────────────────────────────────── */
 
-export interface GridNode {
-  i: number;
-  j: number;
-}
-
-export interface NpcCar {
-  id: number;
-  from: GridNode;
-  to: GridNode;
-  t: number;
-  speedKmh: number; // 0 = parked
-  parked: boolean;
-  color: string;
-  parkedUntil?: number; // engine-time seconds; parked cars leave after a while
-}
-
-export interface Pedestrian {
-  id: number;
-  node: GridNode;
-  axis: "h" | "v"; // crossing along x (h) or y (v)
-  progress: number; // -1 → 1 across the road
-  speed: number;
-}
-
-export type GameMode = "autopilot" | "human";
 export type EngineStatus = "running" | "thinking" | "error" | "ended";
+export type GameMode = "autopilot" | "human";
+
+export type TrafficKind = "car" | "taxi" | "truck" | "police" | "ambulance";
+
+export interface TrafficCar {
+  id: number;
+  s: number; // arc length along route
+  dir: 1 | -1;
+  speedMs: number;
+  baseSpeedMs: number;
+  kind: TrafficKind;
+  color: string;
+  changing: boolean; // overtaking wiggle
+}
+
+export interface CrossingEntity {
+  id: number;
+  s: number;
+  lateral: number; // current lateral offset (crossing)
+  from: number; // start lateral
+  to: number; // target lateral
+  speed: number; // m/s lateral
+  kind: "persona" | "perro";
+  done: boolean;
+}
+
+export interface ManeuverView {
+  s: number;
+  type: string;
+  modifier: string;
+  instruction: string;
+  distanceM: number;
+}
 
 export interface DecisionLogEntry {
   tick: number;
   speedAction: SpeedAction;
-  speedProbs: Record<string, number>;
-  direction: Direction;
+  cruise: CruiseChoice;
   danger: number;
+  maneuverSafe: number;
   confidence: number;
   latencyMs: number;
   source: "jev" | "human";
-  applied: boolean;
 }
 
 export interface Snapshot {
@@ -76,19 +83,19 @@ export interface Snapshot {
   status: EngineStatus;
   speedKmh: number;
   speedLimitKmh: number;
-  heading: Heading;
-  distanceToIntersectionM: number;
+  roadName: string;
+  progressPct: number;
+  remainingM: number;
+  nextManeuver: ManeuverView | null;
+  afterNext: string | null;
+  cruiseActive: boolean;
+  cruiseTargetKmh: number | null;
   score: number;
   distanceM: number;
-  destinationsReached: number;
   incidents: number;
   decisions: number;
-  destination: GridNode;
-  latchedTurn: Direction | null;
-  dangerLevel: number;
   autopilot: boolean;
-  availableDirections: Direction[];
-  destinationHint: Direction;
+  emergency: boolean;
 }
 
 export interface TripResult {
@@ -97,8 +104,19 @@ export interface TripResult {
   durationS: number;
   decisions: number;
   incidents: number;
-  destinationsReached: number;
+  destinationsReached: number; // maneuvers completed
   crashed: boolean;
+  arrived: boolean;
+  reason: string;
+}
+
+export interface DecisionView {
+  tick: number;
+  perception: PerceptionState;
+  response: DecideResponse | null;
+  pending: boolean;
+  humanApplied: boolean;
+  mode: GameMode;
 }
 
 export interface EngineCallbacks {
@@ -110,114 +128,97 @@ export interface EngineCallbacks {
   requestDecision: (state: PerceptionState) => Promise<DecideResponse>;
 }
 
-export interface DecisionView {
-  tick: number;
-  perception: PerceptionState;
-  rawState: unknown;
-  response: DecideResponse | null;
-  pending: boolean;
-  humanApplied: boolean;
-  mode: GameMode;
-}
-
-/* ────────────────────────────────────────────────────────────────
-   Helpers
-──────────────────────────────────────────────────────────────── */
-
-const nodePx = (n: GridNode) => ({ x: n.i * SPACING, y: n.j * SPACING });
-const sameNode = (a: GridNode, b: GridNode) => a.i === b.i && a.j === b.j;
-const inGrid = (n: GridNode) =>
-  n.i >= 0 && n.i < GRID && n.j >= 0 && n.j < GRID;
-
-const DIRS: Record<Heading, { dx: number; dy: number; angle: number }> = {
-  E: { dx: 1, dy: 0, angle: 0 },
-  W: { dx: -1, dy: 0, angle: 180 },
-  S: { dx: 0, dy: 1, angle: 90 },
-  N: { dx: 0, dy: -1, angle: 270 },
-};
-
-function headingBetween(a: GridNode, b: GridNode): Heading {
-  if (b.i > a.i) return "E";
-  if (b.i < a.i) return "W";
-  if (b.j > a.j) return "S";
-  return "N";
-}
-
-function turnToHeading(current: Heading, turn: Direction): Heading {
-  const angle = DIRS[current].angle;
-  const next = turn === "straight" ? angle : turn === "left" ? angle - 90 : angle + 90;
-  const norm = ((next % 360) + 360) % 360;
-  return (Object.keys(DIRS) as Heading[]).find(
-    (h) => DIRS[h].angle === norm,
-  )!;
-}
-
-function edgeLimits(): Map<string, number> {
-  // deterministic pseudo-random speed limit per edge
-  const map = new Map<string, number>();
-  const limits = [30, 50, 50, 70];
-  for (let i = 0; i < GRID; i++) {
-    for (let j = 0; j < GRID; j++) {
-      if (i + 1 < GRID)
-        map.set(`${i},${j}-${i + 1},${j}`, limits[(i * 7 + j * 3) % limits.length]);
-      if (j + 1 < GRID)
-        map.set(`${i},${j}-${i},${j + 1}`, limits[(i * 3 + j * 5 + 1) % limits.length]);
-    }
-  }
-  return map;
-}
-
 let uid = 1;
+
+const MAJOR_TYPES = new Set([
+  "turn",
+  "roundabout",
+  "rotary",
+  "exit roundabout",
+  "exit rotary",
+  "fork",
+  "merge",
+  "on ramp",
+  "off ramp",
+  "arrive",
+]);
 
 /* ────────────────────────────────────────────────────────────────
    Engine
 ──────────────────────────────────────────────────────────────── */
 
+export interface EngineOptions {
+  /** wall-clock ms between decisions (0 = every tick; used by tests) */
+  decisionEveryMs?: number;
+}
+
 export class AutopilotGame {
   private cb: EngineCallbacks;
-  private raf = 0;
+  private timer: number | null = null;
+  private raf: number | null = null;
   private lastTs = 0;
   private elapsed = 0;
-  private decisionTimer = 0;
+  private simTime = 0;
+  private lastDecisionWall = 0;
+  private lastDecisionSim = -999;
+  private decisionSentWall = 0;
+  private stoppedTime = 0;
+  private decisionEveryMs: number;
+  private stuckBehindS = 0;
   private pendingDecision = false;
 
-  // Tesla state
-  private from: GridNode = { i: 0, j: 3 };
-  private to: GridNode = { i: 1, j: 3 };
-  private t = 0;
-  private heading: Heading = "E";
+  // route
+  proj: Projection;
+  poly: Polyline;
+  steps: ReturnType<typeof stepsWithS>;
+  totalM: number;
+  destLocal: { x: number; y: number };
+
+  // Tesla
+  private s = 0;
   private speedKmh = 0;
-  private speedLimitKmh = 50;
-  private latchedTurn: Direction | null = null;
-  private accelCmd: SpeedAction = "maintain";
+  private accelCmd: SpeedAction = "accelerate";
   private emergency = false;
+  private cruiseActive = false;
+  private cruiseTargetKmh: number | null = null;
 
-  // World
-  private limits = edgeLimits();
-  private npcs: NpcCar[] = [];
-  private peds: Pedestrian[] = [];
-  private destination: GridNode = { i: 6, j: 1 };
-  private npcSpawnTimer = 0;
-  private pedSpawnTimer = 0;
+  // world
+  private traffic: TrafficCar[] = [];
+  private crossings: CrossingEntity[] = [];
+  private spawnTimer = 0;
+  private crossSpawnTimer = 0;
 
-  // Stats
+  // stats
   private tick = 0;
   private score = 0;
   private distanceM = 0;
-  private destinationsReached = 0;
   private incidents = 0;
   private decisions = 0;
+  private maneuversDone = 0;
   private lastDecel = 0;
   private crashed = false;
+  private arrived = false;
   private startedAt = 0;
+  private nextManeuverIdx = 0;
 
   mode: GameMode = "autopilot";
   status: EngineStatus = "running";
   currentDecision: DecisionView | null = null;
+  route: RouteData;
 
-  constructor(cb: EngineCallbacks) {
+  constructor(route: RouteData, cb: EngineCallbacks, opts: EngineOptions = {}) {
+    this.route = route;
     this.cb = cb;
-    this.reset();
+    this.decisionEveryMs = opts.decisionEveryMs ?? DECISION_INTERVAL_S * 1000;
+    const [lon0, lat0] = route.points[0];
+    this.proj = createProjection(lon0, lat0);
+    this.poly = new Polyline(route.points.map(([lon, lat]) => this.proj.toLocal(lon, lat)));
+    this.steps = stepsWithS(this.poly, this.proj, route.steps);
+    this.totalM = this.poly.total;
+    const [dLon, dLat] = route.points[route.points.length - 1];
+    this.destLocal = this.proj.toLocal(dLon, dLat);
+    this.nextManeuverIdx = this.findNextManeuver(0);
+    for (let i = 0; i < 5; i++) this.spawnTraffic(true);
   }
 
   /* ── lifecycle ────────────────────────────────────────────── */
@@ -225,282 +226,345 @@ export class AutopilotGame {
   start() {
     this.startedAt = performance.now();
     this.lastTs = performance.now();
-    const loop = (ts: number) => {
-      const dt = Math.min((ts - this.lastTs) / 1000, 0.05);
-      this.lastTs = ts;
-      this.elapsed += dt;
-      this.update(dt);
-      this.raf = requestAnimationFrame(loop);
+    // setInterval instead of rAF: the simulation must keep running even if
+    // the browser throttles rAF (background tab, headless). Rendering happens
+    // inside update() at up to ~30 fps, which is plenty for this view.
+    // Drive the sim from BOTH rAF (smooth when the tab is visible) and a
+    // wall-clock interval with sub-step catch-up (keeps ~real time even when
+    // Chromium throttles hidden/headless pages to 1 Hz timers). Whichever
+    // fires more often leads; the wall-delta makes them cooperate without
+    // double-advancing.
+    const tick = () => {
+      const now = performance.now();
+      let remaining = Math.min((now - this.lastTs) / 1000, MAX_CATCHUP_S);
+      this.lastTs = now;
+      while (remaining > 1e-4) {
+        const dt = Math.min(remaining, FIXED_STEP_S);
+        remaining -= dt;
+        this.elapsed += dt;
+        this.update(dt);
+        if (this.status === "ended") break;
+      }
     };
-    this.raf = requestAnimationFrame(loop);
+    this.timer = window.setInterval(tick, 250);
+    const rafLoop = () => {
+      if (this.timer === null) return; // stopped
+      tick();
+      this.raf = requestAnimationFrame(rafLoop);
+    };
+    this.raf = requestAnimationFrame(rafLoop);
   }
 
   stop() {
-    cancelAnimationFrame(this.raf);
-  }
-
-  reset() {
-    this.tick = 0;
-    this.score = 0;
-    this.distanceM = 0;
-    this.destinationsReached = 0;
-    this.incidents = 0;
-    this.decisions = 0;
-    this.crashed = false;
-    this.emergency = false;
-    this.speedKmh = 0;
-    this.accelCmd = "maintain";
-    this.latchedTurn = null;
-    this.npcs = [];
-    this.peds = [];
-    this.status = "running";
-    this.decisionTimer = 0;
-    this.pendingDecision = false;
-
-    // random far-apart start & destination
-    const rnd = (m: number) => Math.floor(Math.random() * m);
-    this.from = { i: rnd(GRID), j: rnd(GRID) };
-    this.destination = this.from;
-    while (sameNode(this.destination, this.from)) {
-      this.destination = { i: rnd(GRID), j: rnd(GRID) };
-    }
-    this.pickInitialEdge();
-
-    // parked cars
-    for (let k = 0; k < 3; k++) this.spawnNpc(true);
-    this.currentDecision = null;
-  }
-
-  private pickInitialEdge() {
-    const opts: GridNode[] = [];
-    const { i, j } = this.from;
-    if (i + 1 < GRID) opts.push({ i: i + 1, j });
-    if (i - 1 >= 0) opts.push({ i: i - 1, j });
-    if (j + 1 < GRID) opts.push({ i, j: j + 1 });
-    if (j - 1 >= 0) opts.push({ i, j: j - 1 });
-    this.to = opts[Math.floor(Math.random() * opts.length)];
-    this.t = 0;
-    this.heading = headingBetween(this.from, this.to);
-    this.speedLimitKmh = this.limitFor(this.from, this.to);
-  }
-
-  endTrip() {
-    this.status = "ended";
-    this.cb.onTripEnd({
-      score: Math.round(this.score),
-      distanceM: Math.round(this.distanceM),
-      durationS: Math.round((performance.now() - this.startedAt) / 1000),
-      decisions: this.decisions,
-      incidents: this.incidents,
-      destinationsReached: this.destinationsReached,
-      crashed: this.crashed,
-    });
+    if (this.timer !== null) window.clearInterval(this.timer);
+    this.timer = null;
+    if (this.raf !== null) cancelAnimationFrame(this.raf);
+    this.raf = null;
   }
 
   setMode(mode: GameMode) {
     this.mode = mode;
   }
 
-  /* ── world spawns ─────────────────────────────────────────── */
-
-  private spawnNpc(parked = false, movingDensity = 4) {
-    const moving = this.npcs.filter((n) => !n.parked).length;
-    if (!parked && moving >= movingDensity + this.destinationsReached) return;
-    for (let attempt = 0; attempt < 12; attempt++) {
-      const a = { i: Math.floor(Math.random() * GRID), j: Math.floor(Math.random() * GRID) };
-      const neighbors: GridNode[] = [];
-      if (a.i + 1 < GRID) neighbors.push({ i: a.i + 1, j: a.j });
-      if (a.i - 1 >= 0) neighbors.push({ i: a.i - 1, j: a.j });
-      if (a.j + 1 < GRID) neighbors.push({ i: a.i, j: a.j + 1 });
-      if (a.j - 1 >= 0) neighbors.push({ i: a.i, j: a.j - 1 });
-      const b = neighbors[Math.floor(Math.random() * neighbors.length)];
-      // keep spawn away from the Tesla
-      if (sameNode(a, this.from) || sameNode(b, this.from)) continue;
-      const occupied =
-        !parked &&
-        this.npcs.some(
-          (n) =>
-            (sameNode(n.from, a) && sameNode(n.to, b)) ||
-            (sameNode(n.from, b) && sameNode(n.to, a)),
-        );
-      if (occupied) continue;
-      this.npcs.push({
-        id: uid++,
-        from: a,
-        to: b,
-        t: parked ? 0.25 + Math.random() * 0.5 : Math.random() * 0.6,
-        speedKmh: parked ? 0 : 22 + Math.random() * 26,
-        parked,
-        parkedUntil: parked ? this.elapsed + 15 + Math.random() * 15 : undefined,
-        color: parked
-          ? "#5b6472"
-          : ["#8e99a8", "#a86f5c", "#5c7a99", "#7a8c5c", "#99685c"][
-              Math.floor(Math.random() * 5)
-            ],
-      });
-      return;
-    }
-  }
-
-  private spawnPed() {
-    if (this.peds.length >= 3) return;
-    const node = {
-      i: Math.floor(Math.random() * GRID),
-      j: Math.floor(Math.random() * GRID),
-    };
-    if (sameNode(node, this.destination)) return;
-    this.peds.push({
-      id: uid++,
-      node,
-      axis: Math.random() < 0.5 ? "h" : "v",
-      progress: -1,
-      speed: 0.35 + Math.random() * 0.2,
+  endTrip() {
+    if (this.status === "ended") return;
+    this.status = "ended";
+    this.cb.onTripEnd({
+      score: Math.round(this.score),
+      distanceM: Math.round(this.distanceM),
+      durationS: Math.round(this.simTime),
+      decisions: this.decisions,
+      incidents: this.incidents,
+      destinationsReached: this.maneuversDone,
+      crashed: this.crashed,
+      arrived: this.arrived,
+      reason: this.arrived
+        ? "Has llegado a tu destino"
+        : this.crashed
+          ? (this.crashReason ?? "Accidente")
+          : "Viaje finalizado",
     });
   }
 
-  /* ── geometry helpers ─────────────────────────────────────── */
+  /* ── traffic spawning ─────────────────────────────────────── */
 
-  get pos() {
-    const a = nodePx(this.from);
-    const b = nodePx(this.to);
-    return { x: a.x + (b.x - a.x) * this.t, y: a.y + (b.y - a.y) * this.t };
-  }
-
-  private limitFor(a: GridNode, b: GridNode): number {
-    const key = `${a.i},${a.j}-${b.i},${b.j}`;
-    const rev = `${b.i},${b.j}-${a.i},${a.j}`;
-    return this.limits.get(key) ?? this.limits.get(rev) ?? 50;
-  }
-
-  private availableTurns(): Direction[] {
-    const out: Direction[] = [];
-    for (const turn of ["straight", "left", "right"] as Direction[]) {
-      const h = turnToHeading(this.heading, turn);
-      const next = {
-        i: this.to.i + DIRS[h].dx,
-        j: this.to.j + DIRS[h].dy,
-      };
-      if (inGrid(next)) out.push(turn);
+  private spawnTraffic(initial = false) {
+    const forward = this.traffic.filter((t) => t.dir === 1).length;
+    const oncoming = this.traffic.filter((t) => t.dir === -1).length;
+    const limit = this.currentLimit();
+    const roll = Math.random();
+    if (roll < 0.62 && forward < 7) {
+      const kind: TrafficKind =
+        Math.random() < 0.08 ? "truck" : Math.random() < 0.25 ? "taxi" : "car";
+      const factor = kind === "truck" ? 0.72 : 0.82 + Math.random() * 0.15;
+      const s = this.s + (initial ? 120 + Math.random() * 600 : 320 + Math.random() * 500);
+      this.traffic.push({
+        id: uid++,
+        s,
+        dir: 1,
+        speedMs: ((limit * factor) / 3.6) as number,
+        baseSpeedMs: (limit * factor) / 3.6,
+        kind,
+        color: ["#8e99a8", "#a86f5c", "#5c7a99", "#7a8c5c", "#99685c", "#c2c7ce"][
+          Math.floor(Math.random() * 6)
+        ],
+        changing: false,
+      });
+    } else if (oncoming < 5) {
+      const kind: TrafficKind =
+        Math.random() < 0.25 ? "police" : Math.random() < 0.3 ? "ambulance" : "car";
+      const extra = kind === "car" ? 0 : 12; // emergency services rush
+      const s = this.s + (initial ? 200 + Math.random() * 600 : 350 + Math.random() * 550);
+      this.traffic.push({
+        id: uid++,
+        s,
+        dir: -1,
+        speedMs: (Math.min(limit + extra, 130) / 3.6) as number,
+        baseSpeedMs: Math.min(limit + extra, 130) / 3.6,
+        kind,
+        color: kind === "police" ? "#22262c" : kind === "ambulance" ? "#f0f2f5" : "#8e99a8",
+        changing: false,
+      });
     }
-    return out;
   }
 
-  private bestDirectionToDestination(): Direction {
-    const avail = this.availableTurns();
-    if (avail.length === 0) return "straight";
-    let best = avail[0];
-    let bestDist = Infinity;
-    for (const turn of avail) {
-      const h = turnToHeading(this.heading, turn);
-      const next = {
-        i: this.to.i + DIRS[h].dx,
-        j: this.to.j + DIRS[h].dy,
-      };
-      const d = Math.abs(next.i - this.destination.i) + Math.abs(next.j - this.destination.j);
-      if (d < bestDist) {
-        bestDist = d;
-        best = turn;
-      }
-    }
-    return best;
+  private lastCrossingDoneWall = -99999;
+  private lastCrossingS = -999;
+
+  private spawnCrossing() {
+    if (this.crossings.length >= 3) return;
+    // cooldown so a stopped car gets a window to proceed after one crosses
+    if (performance.now() - this.lastCrossingDoneWall < 8000) return;
+    // spawn at upcoming maneuver locations (intersections)
+    const man = this.nextManeuver();
+    const candidates = [man?.s, this.peekManeuver(1)?.s]
+      .filter((v): v is number => typeof v === "number" && v > this.s + 25)
+      .filter((v) => Math.abs(v - this.s) < 450)
+      .filter((v) => Math.abs(v - this.lastCrossingS) > 30);
+    if (candidates.length === 0 || Math.random() < 0.35) return;
+    const s = candidates[Math.floor(Math.random() * candidates.length)] + (Math.random() * 14 - 4);
+    const dir = Math.random() < 0.5 ? 1 : -1;
+    const isDog = Math.random() < 0.22;
+    this.crossings.push({
+      id: uid++,
+      s,
+      lateral: -dir * 7,
+      from: -dir * 7,
+      to: dir * 7,
+      speed: isDog ? 2.6 + Math.random() : 1.1 + Math.random() * 0.5,
+      kind: isDog ? "perro" : "persona",
+      done: false,
+    });
   }
 
   /* ── perception ───────────────────────────────────────────── */
 
-  private detectVehicleAhead(): { distanceM: number; speedKmh: number } | null {
-    let best: { gapPx: number; speedKmh: number } | null = null;
-    for (const n of this.npcs) {
-      const sameEdge =
-        sameNode(n.from, this.from) &&
-        sameNode(n.to, this.to) &&
-        headingBetween(n.from, n.to) === this.heading;
-      if (!sameEdge) continue; // parked cars on the same edge count as obstacles too
-      const gap = (n.t - this.t) * SPACING;
-      if (gap > 1 && (!best || gap < best.gapPx)) {
-        best = { gapPx: gap, speedKmh: n.speedKmh };
-      }
+  private currentStepIdx(): number {
+    let idx = 0;
+    for (let i = 0; i < this.steps.length; i++) {
+      if (this.steps[i].s <= this.s + 0.5) idx = i;
+      else break;
     }
-    return best ? { distanceM: best.gapPx / PX_PER_M, speedKmh: best.speedKmh } : null;
+    return idx;
   }
 
-  private detectOncoming(): { distanceM: number; speedKmh: number } | null {
-    for (const n of this.npcs) {
-      const opposite =
-        sameNode(n.from, this.to) &&
-        sameNode(n.to, this.from) &&
-        !n.parked;
-      if (!opposite) continue;
-      const gapPx = (1 - this.t + (1 - n.t)) * SPACING - SPACING;
-      if (gapPx > 2) return { distanceM: gapPx / PX_PER_M, speedKmh: n.speedKmh };
+  private currentLimit(): number {
+    return limitForStep(this.steps[this.currentStepIdx()] ?? this.steps[0], this.currentStepIdx());
+  }
+
+  private currentRoadName(): string {
+    return this.steps[this.currentStepIdx()]?.name || "vía sin nombre";
+  }
+
+  private findNextManeuver(fromIdx: number): number {
+    for (let i = Math.max(0, fromIdx); i < this.steps.length; i++) {
+      if (this.steps[i].s > this.s + 3 && MAJOR_TYPES.has(this.steps[i].type)) return i;
+    }
+    return -1;
+  }
+
+  private nextManeuver(): ManeuverView | null {
+    let idx = this.nextManeuverIdx;
+    if (idx >= 0 && this.steps[idx].s <= this.s + 3) {
+      // we just passed this maneuver
+      this.maneuversDone++;
+      this.score += 150;
+    }
+    if (idx < 0 || this.steps[idx].s <= this.s + 3) {
+      idx = this.findNextManeuver(idx < 0 ? 0 : idx);
+      this.nextManeuverIdx = idx;
+    }
+    if (idx < 0) return null;
+    const st = this.steps[idx];
+    return {
+      s: st.s,
+      type: st.type,
+      modifier: st.modifier,
+      instruction: instructionFor(st),
+      distanceM: Math.max(0, st.s - this.s),
+    };
+  }
+
+  private peekManeuver(ahead: number): ManeuverView | null {
+    let found = -1;
+    let count = 0;
+    for (let i = Math.max(0, this.nextManeuverIdx); i < this.steps.length; i++) {
+      if (this.steps[i].s <= this.s + 3 || !MAJOR_TYPES.has(this.steps[i].type)) continue;
+      if (count === ahead) {
+        found = i;
+        break;
+      }
+      count++;
+    }
+    if (found < 0) return null;
+    const st = this.steps[found];
+    return { s: st.s, type: st.type, modifier: st.modifier, instruction: instructionFor(st), distanceM: Math.max(0, st.s - this.s) };
+  }
+
+  private nearestAhead(): TrafficCar | null {
+    let best: TrafficCar | null = null;
+    for (const t of this.traffic) {
+      if (t.dir !== 1) continue;
+      const ds = t.s - this.s;
+      if (ds > 0.5 && ds < 150 && (!best || t.s < best.s)) best = t;
+    }
+    return best;
+  }
+
+  private vehicleAhead(): { type: string; distanceM: number; speedKmh: number } | null {
+    let best: TrafficCar | null = null;
+    for (const t of this.traffic) {
+      if (t.dir !== 1) continue;
+      const ds = t.s - this.s;
+      if (ds > 0.5 && ds < 150 && (!best || t.s < best.s)) best = t;
+    }
+    if (!best) return null;
+    const ds = best.s - this.s;
+    const kindName: Record<TrafficKind, string> = {
+      car: "coche",
+      taxi: "taxi",
+      truck: "camión",
+      police: "coche de policía",
+      ambulance: "ambulancia",
+    };
+    return { type: kindName[best.kind], distanceM: Math.round(ds), speedKmh: Math.round(best.speedMs * 3.6) };
+  }
+
+  private oncomingVehicle(): { type: string; distanceM: number; speedKmh: number } | null {
+    let best: TrafficCar | null = null;
+    for (const t of this.traffic) {
+      if (t.dir !== -1) continue;
+      const ds = t.s - this.s; // ahead positive
+      if (ds > 1 && ds < 160 && (!best || ds < best.s - this.s)) best = t;
+    }
+    if (!best) return null;
+    const kindName: Record<TrafficKind, string> = {
+      car: "coche",
+      taxi: "taxi",
+      truck: "camión",
+      police: "policía",
+      ambulance: "ambulancia",
+    };
+    return { type: kindName[best.kind], distanceM: Math.round(best.s - this.s), speedKmh: Math.round(best.speedMs * 3.6) };
+  }
+
+  private emergencyVehicle(): { type: string; distanceM: number; speedKmh: number } | null {
+    for (const t of this.traffic) {
+      if (t.dir !== -1) continue;
+      if (t.kind !== "police" && t.kind !== "ambulance") continue;
+      const ds = t.s - this.s;
+      if (ds > 1 && ds < 220) {
+        return {
+          type: t.kind === "police" ? "policía" : "ambulancia",
+          distanceM: Math.round(ds),
+          speedKmh: Math.round(t.speedMs * 3.6),
+        };
+      }
     }
     return null;
   }
 
-  private detectPedestrian(): { distanceM: number } | null {
-    for (const p of this.peds) {
-      if (!sameNode(p.node, this.to)) continue;
-      const distToIntersection = (1 - this.t) * SPACING;
-      if (Math.abs(p.progress) < 0.9) {
-        return { distanceM: distToIntersection / PX_PER_M };
-      }
+  private pedestrianAhead(): { kind: "persona" | "perro"; distanceM: number } | null {
+    let best: CrossingEntity | null = null;
+    for (const c of this.crossings) {
+      if (c.done) continue;
+      const ds = c.s - this.s;
+      // only report pedestrians that are actually relevant to the car now —
+      // reporting ones 100 m away made Jev brake forever and stall the trip
+      if (ds > -2 && ds < 45 && (!best || Math.abs(ds) < Math.abs(best.s - this.s))) best = c;
     }
-    return null;
+    return best ? { kind: best.kind, distanceM: Math.round(best.s - this.s) } : null;
   }
 
   private buildPerception(): PerceptionState {
-    const vehAhead = this.detectVehicleAhead();
-    const oncoming = this.detectOncoming();
-    const ped = this.detectPedestrian();
-    const dx = this.destination.i - this.to.i;
-    const dy = this.destination.j - this.to.j;
-    const parts: string[] = [];
-    if (dy < 0) parts.push(`${-dy} manzana(s) al norte`);
-    if (dy > 0) parts.push(`${dy} manzana(s) al sur`);
-    if (dx > 0) parts.push(`${dx} manzana(s) al este`);
-    if (dx < 0) parts.push(`${-dx} manzana(s) al oeste`);
+    const veh = this.vehicleAhead();
+    const oncoming = this.oncomingVehicle();
+    const emerg = this.emergencyVehicle();
+    const ped = this.pedestrianAhead();
+    const man = this.nextManeuver();
+    const after = this.peekManeuver(1);
+    const limit = this.currentLimit();
+    const laneAhead = ped
+      ? `${ped.kind} cruzando la calzada`
+      : emerg
+        ? `Vehículo de emergencia (${emerg.type}) acercándose`
+        : veh && veh.distanceM < 40
+          ? `Ocupada: ${veh.type} a ${veh.distanceM} m`
+          : oncoming && oncoming.distanceM < 40
+            ? "Tráfico en sentido contrario cercano"
+            : "Despejada";
     return {
       tick: this.tick,
-      autopilot: {
+      gps: {
         speedKmh: Math.round(this.speedKmh),
-        speedLimitKmh: this.speedLimitKmh,
-        heading: this.heading,
-        distanceToIntersectionM: Math.round(((1 - this.t) * SPACING) / PX_PER_M),
-        availableDirections: this.availableTurns(),
-        destinationRelative: parts.join(" y ") || "estás en el destino",
-        destinationHint: this.bestDirectionToDestination(),
+        speedLimitKmh: limit,
+        roadName: this.currentRoadName(),
+        progressPct: Math.round((this.s / this.totalM) * 100),
+        remainingM: Math.round(this.totalM - this.s),
+        distanceToManeuverM: Math.round(man?.distanceM ?? 0),
+        nextManeuver: man?.instruction ?? "Continúa hasta el destino",
+        maneuverType: man?.type ?? "continue",
+        maneuverModifier: man?.modifier ?? "straight",
+        afterNextManeuver: after ? after.instruction : null,
+        cruiseActive: this.cruiseActive,
+        cruiseTargetKmh: this.cruiseTargetKmh,
+        fastRoad: limit >= 90,
       },
-      perception: {
-        laneAhead:
-          vehAhead && vehAhead.distanceM < 25
-            ? "Ocupado por un vehículo"
-            : oncoming && oncoming.distanceM < 25
-              ? "Vehículo en sentido contrario acercándose"
-              : "Despejada",
-        vehicleAhead: vehAhead
-          ? {
-              type: vehAhead.speedKmh === 0 ? "coche aparcado" : "coche en marcha",
-              distanceM: Math.round(vehAhead.distanceM),
-              speedKmh: Math.round(vehAhead.speedKmh),
-            }
-          : null,
-        oncomingVehicle: oncoming
-          ? {
-              distanceM: Math.round(oncoming.distanceM),
-              speedKmh: Math.round(oncoming.speedKmh),
-            }
-          : null,
-        pedestrian: ped ? { distanceM: ped.distanceM } : null,
+      traffic: {
+        laneAhead,
+        vehicleAhead: veh,
+        oncomingVehicle: oncoming,
+        emergencyVehicle: emerg,
+        pedestrian: ped,
       },
     };
   }
 
   /* ── decision loop ────────────────────────────────────────── */
 
-  private maybeDecide(dt: number) {
-    if (this.status === "ended" || this.pendingDecision) return;
-    this.decisionTimer += dt;
-    if (this.decisionTimer < DECISION_INTERVAL_S) return;
-    this.decisionTimer = 0;
+  private maybeDecide(_dt: number) {
+    if (this.status === "ended") return;
+    // pace decisions by wall clock so throttled tabs still decide on time
+    const now = performance.now();
+    // a request that never settles (hung upstream fetch) must not freeze the
+    // loop forever: give up after 12 s, brake for safety and keep going
+    if (this.pendingDecision) {
+      if (now - this.decisionSentWall < 12000) return;
+      this.pendingDecision = false;
+      this.status = "error";
+      this.accelCmd = "brake";
+      this.cb.onError("Jev no respondió a tiempo; reintentando…");
+      setTimeout(() => {
+        if (this.status === "error") this.status = "running";
+      }, 1500);
+    }
+    // pace decisions in SIMULATION time so throttled tabs get the same
+    // behaviour as visible ones (wall-clock pacing made commands alternate
+    // faster than the physics could apply them and the car averaged to 0)
+    if (this.decisionEveryMs > 0 && this.simTime - this.lastDecisionSim < this.decisionEveryMs / 1000) return;
+    this.lastDecisionSim = this.simTime;
+    this.lastDecisionWall = now;
+    this.decisionSentWall = now;
     this.tick++;
     this.pendingDecision = true;
 
@@ -508,7 +572,6 @@ export class AutopilotGame {
     this.currentDecision = {
       tick: this.tick,
       perception: state,
-      rawState: state,
       response: null,
       pending: true,
       humanApplied: false,
@@ -540,14 +603,9 @@ export class AutopilotGame {
     if (this.status !== "ended") this.status = "running";
     this.decisions++;
 
-    const speedAns = res.answers.speed_action;
-    const dirAns = res.answers.next_direction;
-    const dangerAns = res.answers.immediate_danger;
-
     const view: DecisionView = {
       tick: this.tick,
       perception: state,
-      rawState: state,
       response: res,
       pending: false,
       humanApplied: false,
@@ -557,46 +615,76 @@ export class AutopilotGame {
     this.cb.onDecision(view);
 
     if (this.mode === "autopilot") {
-      this.applyJevDecision(speedAns.choice as SpeedAction, dirAns.choice as Direction, dangerAns.noul, "jev");
+      this.applyDecision(
+        res.answers.speed_action.choice as SpeedAction,
+        res.answers.cruise.choice as CruiseChoice,
+        res.answers.immediate_danger.noul,
+        res.answers.maneuver_ok.noul,
+        "jev",
+      );
     }
   }
 
-  private applyJevDecision(
+  private applyDecision(
     speed: SpeedAction,
-    direction: Direction,
+    cruise: CruiseChoice,
     danger: number,
+    maneuverSafe: number,
     source: "jev" | "human",
   ) {
-    const avail = this.availableTurns();
-    const dir = avail.includes(direction)
-      ? direction
-      : avail.length > 0
-        ? avail[Math.floor(Math.random() * avail.length)]
-        : "straight";
-    this.latchedTurn = dir;
+    const limit = this.currentLimit();
     this.emergency = danger >= DANGER_THRESHOLD;
-    this.accelCmd = this.emergency ? "brake" : speed;
+    this.accelCmd = speed;
+
+    // cruise management (Jev can only arm it on fast roads)
+    if (cruise === "off") {
+      this.cruiseActive = false;
+      this.cruiseTargetKmh = null;
+    } else if (limit >= 80) {
+      const target = cruise === "cruise_80" ? 80 : cruise === "cruise_100" ? 100 : 120;
+      this.cruiseActive = true;
+      this.cruiseTargetKmh = Math.min(target, limit + 10);
+    } else {
+      this.cruiseActive = false;
+      this.cruiseTargetKmh = null;
+    }
+
+    // risky maneuver → slow down to take it; but never deadlock: once slow,
+    // creep up to the junction so the maneuver distance keeps shrinking and
+    // Jev gets a chance to mark it safe again
+    if (!this.emergency && maneuverSafe < MANEUVER_SAFE_THRESHOLD) {
+      if (this.speedKmh > 35) {
+        this.accelCmd = "brake";
+        this.incidents++;
+      } else {
+        this.accelCmd = "maintain";
+      }
+    }
 
     const view = this.currentDecision;
     const res = view?.response;
     this.cb.onLog({
       tick: this.tick,
       speedAction: speed,
-      speedProbs: res?.answers.speed_action.probabilities ?? {},
-      direction: dir,
+      cruise,
       danger,
+      maneuverSafe,
       confidence: res?.answers.speed_action.confidence ?? 0,
       latencyMs: res?.latencyMs ?? 0,
       source,
-      applied: true,
     });
   }
 
-  /** Human mode: player pressed a control */
-  applyHumanDecision(speed: SpeedAction, direction: Direction) {
+  applyHumanDecision(speed: SpeedAction, cruise: CruiseChoice) {
     if (this.mode !== "human" || !this.currentDecision) return;
-    const danger = this.currentDecision.response?.answers.immediate_danger.noul ?? 0;
-    this.applyJevDecision(speed, direction, danger, "human");
+    const res = this.currentDecision.response;
+    this.applyDecision(
+      speed,
+      cruise,
+      res?.answers.immediate_danger.noul ?? 0,
+      res?.answers.maneuver_ok.noul ?? 1,
+      "human",
+    );
     this.currentDecision.humanApplied = true;
     this.cb.onDecision(this.currentDecision);
   }
@@ -606,84 +694,155 @@ export class AutopilotGame {
   private update(dt: number) {
     if (this.status === "ended") return;
 
-    // spawn world entities
-    this.npcSpawnTimer += dt;
-    this.pedSpawnTimer += dt;
-    if (this.npcSpawnTimer > 3.5) {
-      this.npcSpawnTimer = 0;
-      this.spawnNpc(false);
+    this.simTime += dt;
+    this.spawnTimer += dt;
+    this.crossSpawnTimer += dt;
+    if (this.spawnTimer > 1.4) {
+      this.spawnTimer = 0;
+      this.spawnTraffic();
     }
-    if (this.pedSpawnTimer > 6) {
-      this.pedSpawnTimer = 0;
-      this.spawnPed();
+    if (this.crossSpawnTimer > 2.2) {
+      this.crossSpawnTimer = 0;
+      this.spawnCrossing();
     }
 
-    // NPC movement
-    for (const n of this.npcs) {
-      if (n.parked || n.speedKmh <= 0) continue;
-      n.t += ((n.speedKmh / 3.6) * PX_PER_M * dt) / SPACING;
-      if (n.t >= 1) {
-        // continue onto a random valid edge
-        const here = n.to;
-        const opts: GridNode[] = [];
-        for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-          const nx = { i: here.i + di, j: here.j + dj };
-          if (inGrid(nx) && !(nx.i === n.from.i && nx.j === n.from.j)) opts.push(nx);
+    // advance traffic (simple car-following for same-direction flow)
+    for (const t of this.traffic) {
+      let v = t.baseSpeedMs;
+      if (t.dir === 1) {
+        for (const o of this.traffic) {
+          if (o === t || o.dir !== 1) continue;
+          const ds = o.s - t.s;
+          if (ds > 0 && ds < 16 && o.speedMs < v) v = o.speedMs;
         }
-        if (opts.length === 0) {
-          n.from = n.to;
-          n.to = { ...n.from };
-          n.t = 0;
-          continue;
+        // don't rear-end a crossing pedestrian: ease off smoothly
+        for (const c of this.crossings) {
+          if (c.done) continue;
+          const ds = c.s - t.s;
+          if (ds > 0 && ds < 16) v = Math.min(v, Math.max(1.0, (ds - 5) * 0.45));
         }
-        n.from = here;
-        n.to = opts[Math.floor(Math.random() * opts.length)];
-        n.t = 0;
+      }
+      // clamp accel/decel so braking chains are predictable
+      const dv = v - t.speedMs;
+      t.speedMs += Math.sign(dv) * Math.min(Math.abs(dv), 7 * dt);
+      t.s += t.dir * t.speedMs * dt;
+    }
+    this.traffic = this.traffic.filter((t) => {
+      const ds = t.s - this.s;
+      return ds > -220 && ds < 1400;
+    });
+
+    // crossings
+    for (const c of this.crossings) {
+      const step = c.speed * dt * Math.sign(c.to - c.from);
+      c.lateral += step;
+      if (Math.abs(c.lateral) >= Math.abs(c.to) && !c.done) {
+        c.done = true;
+        this.lastCrossingDoneWall = performance.now();
+        this.lastCrossingS = c.s;
       }
     }
+    this.crossings = this.crossings.filter((c) => !c.done || Math.abs(c.lateral) < 9);
 
-    // pedestrians
-    for (const p of this.peds) p.progress += p.speed * dt * (p.axis === "h" ? 1 : 1);
-    this.peds = this.peds.filter((p) => p.progress < 1.2);
-
-    // parked cars eventually drive away — no permanent deadlocks
-    this.npcs = this.npcs.filter(
-      (n) => !n.parked || n.parkedUntil === undefined || this.elapsed < n.parkedUntil,
-    );
-
-    // Tesla speed
+    // ── Tesla speed ──
     const prevSpeed = this.speedKmh;
+    const limit = this.currentLimit();
+    const veh = this.vehicleAhead();
+    const gapM = veh ? veh.distanceM : Infinity;
+    const leader = this.nearestAhead();
+
+    // a much slower vehicle ahead eventually turns off the road so the
+    // trip doesn't stall behind a rolling roadblock
+    let slowAhead: TrafficCar | null = null;
+    for (const t of this.traffic) {
+      if (t.dir !== 1) continue;
+      const ds = t.s - this.s;
+      if (ds > 0.5 && ds < 45 && t.speedMs * 3.6 < limit * 0.55) slowAhead = t;
+    }
+    if (slowAhead && this.speedKmh < limit * 0.65) {
+      this.stuckBehindS += dt;
+      if (this.stuckBehindS > 9) {
+        this.stuckBehindS = 0;
+        this.traffic = this.traffic.filter((t) => t.id !== slowAhead!.id);
+      }
+    } else {
+      this.stuckBehindS = Math.max(0, this.stuckBehindS - dt * 2);
+    }
+
     if (this.emergency) {
       this.speedKmh = Math.max(0, this.speedKmh - EMERGENCY_BRAKE * dt);
+    } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {
+      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
+      const target = Math.min(this.cruiseTargetKmh, limit + 10);
+      const safeGap = (this.speedKmh / 3.6) * 2 + 6;
+      if (veh && gapM < safeGap) {
+        this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+      } else if (this.speedKmh < target - 2) {
+        this.speedKmh = Math.min(target, this.speedKmh + ACCEL * dt);
+      } else if (this.speedKmh > target + 2) {
+        this.speedKmh = Math.max(0, this.speedKmh - DRAG * 3 * dt);
+      } else {
+        this.speedKmh = Math.max(0, this.speedKmh - DRAG * dt);
+      }
     } else {
+      const leaderV = leader ? leader.speedMs * 3.6 : null;
       switch (this.accelCmd) {
-        case "accelerate":
-          this.speedKmh = Math.min(
-            Math.min(this.speedLimitKmh + 8, MAX_SPEED),
-            this.speedKmh + ACCEL * dt,
-          );
+        case "accelerate": {
+          // respect a safe following distance even when Jev says go
+          const safeGap = (this.speedKmh / 3.6) * 1.8 + 5;
+          if (veh && gapM < safeGap) {
+            this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+          } else {
+            this.speedKmh = Math.min(Math.min(limit + 8, MAX_SPEED), this.speedKmh + ACCEL * dt);
+          }
           break;
+        }
         case "brake":
           this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
           break;
-        case "maintain":
-          // Tesla-like creep: never stay frozen at 0 when the lane is clear
-          // (a stopped obstacle can be passed cautiously at walking pace)
+        case "maintain": {
+          // never coast into the vehicle ahead: keep a safe gap and match it
+          const safeGap = (this.speedKmh / 3.6) * 1.8 + 5;
+          if (veh && gapM < safeGap * 0.75) {
+            this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
+            break;
+          }
+          if (veh && gapM < safeGap && leaderV !== null) {
+            if (this.speedKmh > leaderV + 1) {
+              this.speedKmh = Math.max(leaderV, this.speedKmh - BRAKE * 0.7 * dt);
+            } else if (this.speedKmh < leaderV - 3) {
+              this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.5 * dt);
+            }
+            break;
+          }
           if (this.speedKmh < 6) {
-            const blocked = this.detectVehicleAhead();
-            const canCreep =
-              !blocked ||
-              (blocked.speedKmh === 0 && blocked.distanceM > 2) ||
-              blocked.distanceM > 9;
-            if (canCreep) {
+            const ped = this.pedestrianAhead();
+            if ((!veh || gapM > 9) && (!ped || ped.distanceM > 12)) {
+              // creep forward like a real Tesla in congestion
               this.speedKmh = Math.min(10, this.speedKmh + 6 * dt);
               break;
             }
           }
           this.speedKmh = Math.max(0, this.speedKmh - DRAG * dt);
           break;
+        }
       }
     }
+    // stuck detector: if we're stopped with nothing in front for a while,
+    // Jev's last order can't be trusted — nudge to maintain, then accelerate
+    if (this.speedKmh < 0.5) {
+      const pedStopped = this.pedestrianAhead();
+      if ((!veh || gapM > 12) && (!pedStopped || pedStopped.distanceM > 14)) {
+        this.stoppedTime += dt;
+        if (this.stoppedTime > 5 && this.accelCmd === "brake") this.accelCmd = "maintain";
+        if (this.stoppedTime > 10) this.accelCmd = "accelerate";
+      } else {
+        this.stoppedTime = 0;
+      }
+    } else {
+      this.stoppedTime = 0;
+    }
+
     const decel = (prevSpeed - this.speedKmh) / Math.max(dt, 0.001);
     if (decel > HARD_BRAKE_INCIDENT && this.lastDecel <= HARD_BRAKE_INCIDENT) {
       this.incidents++;
@@ -691,170 +850,117 @@ export class AutopilotGame {
     }
     this.lastDecel = decel;
 
-    // cautious passing: when squeezed behind a STOPPED obstacle, cap at walking pace
-    const obstacle = this.detectVehicleAhead();
-    if (
-      obstacle &&
-      obstacle.speedKmh === 0 &&
-      obstacle.distanceM * PX_PER_M < 40 &&
-      this.speedKmh > 6
-    ) {
-      this.speedKmh = 6;
-    }
-
     // move
-    const pxPerSec = (this.speedKmh / 3.6) * PX_PER_M;
-    this.t += (pxPerSec * dt) / SPACING;
-    this.distanceM += pxPerSec * dt / PX_PER_M;
-    this.score += pxPerSec * dt / PX_PER_M / 10;
+    this.s += (this.speedKmh / 3.6) * dt;
+    this.distanceM += (this.speedKmh / 3.6) * dt;
+    this.score += ((this.speedKmh / 3.6) * dt) / 8;
 
-    // pedestrian collision check (inside intersection box)
-    const pNow = this.pos;
-    for (const p of this.peds) {
-      if (Math.abs(p.progress) > 0.85) continue;
-      const c = nodePx(p.node);
-      const pp = {
-        x: c.x + (p.axis === "h" ? p.progress * ROAD_W : 0),
-        y: c.y + (p.axis === "v" ? p.progress * ROAD_W : 0),
-      };
-      if (Math.hypot(pp.x - pNow.x, pp.y - pNow.y) < 12 && this.speedKmh > 4) {
-        return this.crash();
-      }
+    // maneuvers completed (counted inside nextManeuver as they are passed)
+    const man = this.nextManeuver();
+
+    // arrival is checked every tick, independent of remaining maneuvers
+    if (!this.arrived && this.s >= this.totalM - ARRIVE_WINDOW_M) {
+      this.arrived = true;
+      this.score += 1500;
+      this.speedKmh = 0;
+      return this.endTrip();
     }
 
-    // arrival at intersection
-    if (this.t >= 1) {
-      this.from = this.to;
-      // destination reached?
-      if (sameNode(this.from, this.destination)) {
-        this.destinationsReached++;
-        this.score += 1000;
-        // pick a new destination far from here
-        let next = this.from;
-        let guard = 0;
-        while (
-          (sameNode(next, this.from) ||
-            Math.abs(next.i - this.from.i) + Math.abs(next.j - this.from.j) < 3) &&
-          guard++ < 40
-        ) {
-          next = {
-            i: Math.floor(Math.random() * GRID),
-            j: Math.floor(Math.random() * GRID),
-          };
+    // crossing entity collision
+    const carLat = LANE;
+    for (const c of this.crossings) {
+      if (c.done) continue;
+      const ds = Math.abs(c.s - this.s);
+      if (ds < 2.2 && Math.abs(c.lateral - carLat) < 1.4 && this.speedKmh > 3) {
+        if (c.kind === "perro" && this.speedKmh <= 18) {
+          this.incidents++;
+          this.score = Math.max(0, this.score - 60);
+          c.done = true; // scared dog runs off
+        } else {
+          return this.crash(`Atropello a un${c.kind === "perro" ? " perro" : " peatón"}`);
         }
-        this.destination = next;
       }
-      this.chooseNextEdge();
     }
 
-    // rear-end collision with NPC ahead on same edge (creeping past at ≤10 km/h is safe)
-    const veh = this.detectVehicleAhead();
-    if (veh && veh.distanceM * PX_PER_M < CAR_LEN * 0.7 && this.speedKmh > 10) {
-      return this.crash();
+    // rear-end: crash only with a real closing speed; a light tap is an incident
+    if (veh && gapM < CAR_LEN_M * 0.55 && this.speedKmh > 10) {
+      const closing = leader ? this.speedKmh - leader.speedMs * 3.6 : 99;
+      if (closing > 18) {
+        return this.crash(`Colisión por alcance con ${veh.type}`);
+      }
+      // light contact: count an incident and match the leader's speed
+      this.incidents++;
+      this.score = Math.max(0, this.score - 50);
+      this.speedKmh = Math.max(0, leader ? leader.speedMs * 3.6 : 0);
+      if (leader) this.s = Math.min(this.s, leader.s - CAR_LEN_M - 0.3);
     }
-    // if blocked behind a stopped car with zero speed for a long time, nudge:
-    // (Jev should brake; if fully stopped behind obstacle, wait — no deadlock since NPCs move)
 
     this.maybeDecide(dt);
-    this.pushFrame();
+    this.cb.onFrame(this.snapshot());
   }
 
-  private chooseNextEdge() {
-    const avail = this.availableTurns();
-    let turn = this.latchedTurn;
-    if (!turn || !avail.includes(turn)) {
-      turn = avail.length > 0 ? avail[Math.floor(Math.random() * avail.length)] : null;
-    }
-    let nextHeading: Heading;
-    if (turn === null) {
-      // U-turn
-      nextHeading = turnToHeading(this.heading, "straight");
-      nextHeading = turnToHeading(nextHeading, "right");
-      nextHeading = turnToHeading(nextHeading, "right");
-    } else {
-      nextHeading = turnToHeading(this.heading, turn);
-    }
-    const next = { i: this.from.i + DIRS[nextHeading].dx, j: this.from.j + DIRS[nextHeading].dy };
-    if (!inGrid(next)) {
-      // safety fallback: any available
-      for (const t2 of avail) {
-        const h2 = turnToHeading(this.heading, t2);
-        const n2 = { i: this.from.i + DIRS[h2].dx, j: this.from.j + DIRS[h2].dy };
-        if (inGrid(n2)) {
-          this.to = n2;
-          this.heading = h2;
-          this.t = 0;
-          this.speedLimitKmh = this.limitFor(this.from, this.to);
-          return;
-        }
-      }
-      this.to = { i: this.from.i - DIRS[this.heading].dx, j: this.from.j - DIRS[this.heading].dy };
-      this.t = 0;
-      return;
-    }
-    this.to = next;
-    this.heading = nextHeading;
-    this.t = 0;
-    this.speedLimitKmh = this.limitFor(this.from, this.to);
-  }
+  private crashReason: string | null = null;
 
-  private crash() {
+  private crash(reason: string) {
+    this.crashReason = reason;
     this.crashed = true;
     this.incidents++;
     this.speedKmh = 0;
     this.endTrip();
   }
 
-  /* ── frame snapshot & render data ─────────────────────────── */
-
-  private pushFrame() {
-    this.cb.onFrame(this.snapshot());
-  }
+  /* ── snapshots ────────────────────────────────────────────── */
 
   snapshot(): Snapshot {
+    const man = this.nextManeuver();
+    const after = this.peekManeuver(1);
     return {
       tick: this.tick,
       status: this.status,
       speedKmh: Math.round(this.speedKmh),
-      speedLimitKmh: this.speedLimitKmh,
-      heading: this.heading,
-      distanceToIntersectionM: Math.round(((1 - this.t) * SPACING) / PX_PER_M),
+      speedLimitKmh: this.currentLimit(),
+      roadName: this.currentRoadName(),
+      progressPct: Math.min(100, Math.round((this.s / this.totalM) * 100)),
+      remainingM: Math.round(this.totalM - this.s),
+      nextManeuver: man,
+      afterNext: after ? after.instruction : null,
+      cruiseActive: this.cruiseActive,
+      cruiseTargetKmh: this.cruiseTargetKmh,
       score: Math.round(this.score),
       distanceM: Math.round(this.distanceM),
-      destinationsReached: this.destinationsReached,
       incidents: this.incidents,
       decisions: this.decisions,
-      destination: this.destination,
-      latchedTurn: this.latchedTurn,
-      dangerLevel: this.emergency ? 1 : 0,
       autopilot: this.mode === "autopilot",
-      availableDirections: this.availableTurns(),
-      destinationHint: this.bestDirectionToDestination(),
+      emergency: this.emergency,
     };
   }
 
-  /** data the canvas renderer needs every frame */
   renderState() {
     return {
-      pos: this.pos,
-      heading: this.heading,
+      proj: this.proj,
+      poly: this.poly,
+      s: this.s,
+      car: this.poly.atOffset(this.s, LANE),
+      accelCmd: this.accelCmd,
+      autopilot: this.mode === "autopilot",
       speedKmh: this.speedKmh,
-      from: this.from,
-      to: this.to,
-      t: this.t,
-      latchedTurn: this.latchedTurn,
+      limit: this.currentLimit(),
+      cruiseActive: this.cruiseActive,
+      cruiseTargetKmh: this.cruiseTargetKmh,
       emergency: this.emergency,
-      npcs: this.npcs,
-      peds: this.peds,
-      destination: this.destination,
-      limits: this.limits,
-      crashed: this.crashed,
-      available: this.availableTurns(),
-      distanceToIntersectionM: ((1 - this.t) * SPACING) / PX_PER_M,
-      vehicleAhead: this.detectVehicleAhead(),
-      oncoming: this.detectOncoming(),
-      pedestrian: this.detectPedestrian(),
+      traffic: this.traffic,
+      crossings: this.crossings,
+      laneOffset: LANE,
+      dest: this.destLocal,
+      nextManeuver: this.nextManeuver(),
+      steps: this.steps,
       elapsed: this.elapsed,
+      crashed: this.crashed,
+      totalM: this.totalM,
+      vehicleAhead: this.vehicleAhead(),
+      oncoming: this.oncomingVehicle(),
+      emergencyVehicle: this.emergencyVehicle(),
+      pedestrian: this.pedestrianAhead(),
     };
   }
 }
