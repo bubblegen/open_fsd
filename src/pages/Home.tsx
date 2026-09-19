@@ -86,7 +86,7 @@ export default function Home() {
 
   const routeQ = trpc.geo.route.useQuery(
     routeParams ?? { fromLat: 0, fromLon: 0, toLat: 0, toLon: 0 },
-    { enabled: !!routeParams, retry: 1, staleTime: Infinity },
+    { enabled: !!routeParams, retry: 2, retryDelay: (n) => 700 * (n + 1), staleTime: Infinity },
   );
 
   const start = (o: GeoPlace, d: GeoPlace) => {
@@ -115,6 +115,7 @@ export default function Home() {
       route={routeQ.data}
       routeError={routeQ.error}
       loadingRoute={routeQ.isLoading}
+      onRetryRoute={() => routeQ.refetch()}
       onBack={backToSetup}
     />
   );
@@ -372,6 +373,7 @@ function GameScreen({
   route,
   routeError,
   loadingRoute,
+  onRetryRoute,
   onBack,
 }: {
   origin: GeoPlace;
@@ -379,6 +381,7 @@ function GameScreen({
   route: RouteData | undefined;
   routeError: unknown;
   loadingRoute: boolean;
+  onRetryRoute: () => void;
   onBack: () => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -494,9 +497,20 @@ function GameScreen({
           <Loader2 className="w-8 h-8 animate-spin text-blue-400" />
           <p className="text-sm text-slate-400">Calculando la ruta…</p>
           {routeError ? (
-            <p className="text-sm text-red-400 max-w-md text-center">
-              {routeError instanceof Error ? routeError.message : "Error obteniendo la ruta"}
-            </p>
+            <div className="flex flex-col items-center gap-2">
+              <p className="text-sm text-red-400 max-w-md text-center">
+                {routeError instanceof Error ? routeError.message : "Error obteniendo la ruta"}
+              </p>
+              <p className="text-xs text-slate-400">Parece un fallo de red con el servicio de rutas. Inténtalo de nuevo.</p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="border-slate-700"
+                onClick={onRetryRoute}
+              >
+                Reintentar
+              </Button>
+            </div>
           ) : null}
         </div>
       </div>

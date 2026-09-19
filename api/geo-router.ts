@@ -7,16 +7,48 @@ const UA = "tesla-autopilot-sim/1.0 (TypeSafe Jev driving demo)";
 const PHOTON = "https://photon.komoot.io/api/";
 const OSRM = "https://router.project-osrm.org/route/v1/driving";
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Egress from the deployed container to public routing APIs is occasionally
+ *  flaky (~1 in 5 fetches dies at connection level). One retry is usually
+ *  enough; after 4 attempts the error is real, not transient. */
 async function fetchJson(url: string): Promise<unknown> {
-  const res = await fetch(url, { headers: { "User-Agent": UA } });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new TRPCError({
-      code: "INTERNAL_SERVER_ERROR",
-      message: `Upstream ${new URL(url).host} returned ${res.status}: ${body.slice(0, 200)}`,
-    });
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": UA } });
+      if (res.ok) return res.json();
+      const body = await res.text().catch(() => "");
+      // 429/5xx may be transient too (demo servers rate-limit); retry those
+      if ((res.status === 429 || res.status >= 500) && attempt < 3) {
+        lastErr = new Error(`HTTP ${res.status}`);
+        await sleep(400 * (attempt + 1));
+        continue;
+      }
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: `Upstream ${new URL(url).host} returned ${res.status}: ${body.slice(0, 200)}`,
+      });
+    } catch (err) {
+      if (err instanceof TRPCError) throw err;
+      lastErr = err;
+      if (attempt < 3) await sleep(400 * (attempt + 1));
+    }
   }
-  return res.json();
+  throw new TRPCError({
+    code: "INTERNAL_SERVER_ERROR",
+    message: `No se pudo contactar con ${new URL(url).host} tras varios intentos: ${
+      lastErr instanceof Error ? lastErr.message : String(lastErr)
+    }`,
+  });
+}
+
+/** Successful routes cached in memory: if the user retries after a flake,
+ *  the second click answers instantly without touching the network. */
+const routeCache = new Map<string, unknown>();
+const ROUTE_CACHE_MAX = 200;
+function cacheKey(tag: string, coords: string): string {
+  return `${tag}:${coords}`;
 }
 
 export const geoRouter = createRouter({
@@ -24,6 +56,9 @@ export const geoRouter = createRouter({
   geocode: publicQuery
     .input(z.object({ q: z.string().min(2).max(200) }))
     .query(async ({ input }) => {
+      const key = cacheKey("geocode", input.q.trim().toLowerCase());
+      const hit = routeCache.get(key);
+      if (hit) return hit;
       const url = `${PHOTON}?q=${encodeURIComponent(input.q)}&limit=6`;
       const data = (await fetchJson(url)) as {
         features?: Array<{
@@ -60,6 +95,11 @@ export const geoRouter = createRouter({
           },
         ];
       });
+      if (routeCache.size >= ROUTE_CACHE_MAX) {
+        const firstKey = routeCache.keys().next().value;
+        if (firstKey !== undefined) routeCache.delete(firstKey);
+      }
+      routeCache.set(key, places);
       return places;
     }),
 
@@ -75,6 +115,9 @@ export const geoRouter = createRouter({
     )
     .query(async ({ input }) => {
       const coords = `${input.fromLon},${input.fromLat};${input.toLon},${input.toLat}`;
+      const key = cacheKey("route", coords);
+      const hit = routeCache.get(key);
+      if (hit) return hit;
       const url = `${OSRM}/${coords}?overview=full&geometries=geojson&steps=true`;
       const data = (await fetchJson(url)) as {
         code?: string;
@@ -121,6 +164,11 @@ export const geoRouter = createRouter({
         points: r.geometry.coordinates,
         steps,
       };
+      if (routeCache.size >= ROUTE_CACHE_MAX) {
+        const firstKey = routeCache.keys().next().value;
+        if (firstKey !== undefined) routeCache.delete(firstKey);
+      }
+      routeCache.set(key, route);
       return route;
     }),
 });
