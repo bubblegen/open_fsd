@@ -2,6 +2,7 @@ import type { DecideResponse, PerceptionState, SpeedAction, CruiseChoice } from 
 import type { RouteData } from "@contracts/geo";
 import {
   Polyline,
+  roundedPolyline,
   createProjection,
   stepsWithS,
   limitForStep,
@@ -15,7 +16,7 @@ import {
 
 const DECISION_INTERVAL_S = 0.9;
 const MAX_SPEED = 130;
-const ACCEL = 9; // km/h per second
+const ACCEL = 15; // km/h per second — brisk EV takeoff, 0→50 in ~3.5 s
 const BRAKE = 30;
 const EMERGENCY_BRAKE = 40;
 const DRAG = 1;
@@ -220,7 +221,10 @@ export class AutopilotGame {
     this.decisionEveryMs = opts.decisionEveryMs ?? DECISION_INTERVAL_S * 1000;
     const [lon0, lat0] = route.points[0];
     this.proj = createProjection(lon0, lat0);
-    this.poly = new Polyline(route.points.map(([lon, lat]) => this.proj.toLocal(lon, lat)));
+    const rawPoly = new Polyline(route.points.map(([lon, lat]) => this.proj.toLocal(lon, lat)));
+    // smooth the OSRM sharp vertices so the car traces — and the painted
+    // trajectory shows — a clean curve through turns (GTA-style racing line)
+    this.poly = roundedPolyline(rawPoly, 7);
     this.steps = stepsWithS(this.poly, this.proj, route.steps);
     this.totalM = this.poly.total;
     const [dLon, dLat] = route.points[route.points.length - 1];
@@ -882,7 +886,7 @@ export class AutopilotGame {
             if (this.speedKmh > leaderV + 1) {
               this.speedKmh = Math.max(leaderV, this.speedKmh - BRAKE * 0.6 * dt);
             } else if (this.speedKmh < leaderV - 2) {
-              this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.5 * dt);
+              this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.7 * dt);
             }
           } else {
             this.speedKmh = Math.min(Math.min(limit + 8, MAX_SPEED), this.speedKmh + ACCEL * dt);
@@ -903,7 +907,7 @@ export class AutopilotGame {
             if (this.speedKmh > leaderV + 1) {
               this.speedKmh = Math.max(leaderV, this.speedKmh - BRAKE * 0.7 * dt);
             } else if (this.speedKmh < leaderV - 3) {
-              this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.5 * dt);
+              this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.7 * dt);
             }
             break;
           }
@@ -912,7 +916,7 @@ export class AutopilotGame {
             // not only when they are 12 m past us — shorter, realistic stops
             const clear = !pedNow || Math.abs(pedNow.lateralM) > 2.2 || pedNow.clearsInS < 1.2;
             if ((!veh || gapM > 9) && clear) {
-              this.speedKmh = Math.min(10, this.speedKmh + 6 * dt);
+              this.speedKmh = Math.min(14, this.speedKmh + 8 * dt); // creep back up briskly after a stop
               break;
             }
           }

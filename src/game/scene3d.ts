@@ -125,6 +125,7 @@ export class Scene3D {
     signals: { l: THREE.Sprite; r: THREE.Sprite };
     ring: THREE.Mesh;
     cones: THREE.Mesh[];
+    wheels: THREE.Mesh[];
   };
   private vehicles = new Map<number, VehicleMesh>();
   private peds = new Map<number, THREE.Group>();
@@ -133,6 +134,9 @@ export class Scene3D {
   private camPos = new THREE.Vector3();
   private camLook = new THREE.Vector3();
   private tmpV = new THREE.Vector3();
+  private carYaw: number | null = null;
+  private wheelSpin = 0;
+  private steerYaw = 0;
 
   constructor(private canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -425,7 +429,8 @@ export class Scene3D {
 
   private buildBuildings(rs: RenderState) {
     const manS = stepsToS(rs);
-    const nearMan = (s: number) => manS.some((m) => Math.abs(m - s) < 18);
+    // keep corners clear: buildings near maneuvers end up in the camera path
+    const nearMan = (s: number) => manS.some((m) => Math.abs(m - s) < 30);
     const mats: THREE.Matrix4[] = [];
     const colors: THREE.Color[] = [];
     const color = new THREE.Color();
@@ -442,7 +447,7 @@ export class Scene3D {
         const depth = 11 + h1 * 9;
         const width = 9 + h2 * 9;
         const height = 7 + h1 * h1 * 34 + h2 * 8;
-        const setback = 4.6 + h3 * 5;
+        const setback = 6.5 + h3 * 5;
         const off = side * (SIDEWALK_OUT + setback + depth / 2);
         const nx = Math.cos(p.angle + Math.PI / 2);
         const nz = Math.sin(p.angle + Math.PI / 2);
@@ -724,10 +729,137 @@ export class Scene3D {
     return { group: g, brake, lightL, lightR, police };
   }
 
+  /** Tesla Model 3: extruded side profile + glass canopy, wheels, light bar. */
   private buildTesla() {
-    const v = this.makeVehicle("car", "#e8ecf4"); // pearl white so the Tesla reads at dusk
-    // sleeker cabin
-    v.group.children[1].scale.set(0.92, 0.8, 1.05);
+    const g = new THREE.Group();
+    const W = 1.85;
+    const L = 4.69;
+
+    const paint = new THREE.MeshPhongMaterial({ color: 0xe9edf5, shininess: 90, specular: 0x9aa4b8 });
+    const glassMat = new THREE.MeshPhongMaterial({ color: 0x0d141d, shininess: 140, specular: 0x46586e });
+
+    // ── body: Model 3 silhouette (shape x = length, y = height), nose at x=-L/2
+    // so rotateY(+90°) puts the nose at +z (vehicle forward) ──
+    const body = new THREE.Shape();
+    body.moveTo(-L / 2, 0.30);
+    body.lineTo(-L / 2 + 0.04, 0.60);                                   // tail face
+    body.quadraticCurveTo(-L / 2 + 0.10, 0.72, -L / 2 + 0.62, 0.74);    // trunk lid
+    body.quadraticCurveTo(-0.85, 1.02, -0.15, 1.21);                    // rear glass
+    body.quadraticCurveTo(0.30, 1.31, 0.80, 1.29);                      // roof
+    body.quadraticCurveTo(1.45, 1.24, 1.90, 0.82);                      // windshield
+    body.quadraticCurveTo(2.20, 0.68, L / 2 - 0.10, 0.62);              // hood
+    body.quadraticCurveTo(L / 2, 0.60, L / 2, 0.50);                    // nose round-off
+    body.lineTo(L / 2, 0.30);                                           // front face
+    body.closePath();
+    const bodyGeo = new THREE.ExtrudeGeometry(body, {
+      depth: W - 0.16,
+      bevelEnabled: true,
+      bevelThickness: 0.07,
+      bevelSize: 0.07,
+      bevelSegments: 3,
+      curveSegments: 10,
+    });
+    bodyGeo.translate(0, 0, -(W - 0.16) / 2);
+    bodyGeo.rotateY(Math.PI / 2); // shape -x → +z (nose forward)
+    const bodyMesh = new THREE.Mesh(bodyGeo, paint);
+    g.add(bodyMesh);
+
+    // ── glass canopy: solid greenhouse → continuous panoramic glass roof ──
+    const canopy = new THREE.Shape();
+    canopy.moveTo(-1.62, 0.72);
+    canopy.quadraticCurveTo(-0.85, 1.06, -0.15, 1.245);
+    canopy.quadraticCurveTo(0.30, 1.345, 0.80, 1.325);
+    canopy.quadraticCurveTo(1.45, 1.28, 1.95, 0.86);
+    canopy.lineTo(1.95, 0.72);
+    canopy.closePath();
+    const canopyGeo = new THREE.ExtrudeGeometry(canopy, {
+      depth: 1.42,
+      bevelEnabled: true,
+      bevelThickness: 0.05,
+      bevelSize: 0.05,
+      bevelSegments: 2,
+      curveSegments: 10,
+    });
+    canopyGeo.translate(0, 0.015, -0.71);
+    canopyGeo.rotateY(Math.PI / 2);
+    g.add(new THREE.Mesh(canopyGeo, glassMat));
+
+    // ── wheels with rims (front axle steers visually) ──
+    const tireGeo = new THREE.CylinderGeometry(0.34, 0.34, 0.235, 14);
+    const rimGeo = new THREE.CylinderGeometry(0.195, 0.195, 0.245, 10);
+    const tireMat = new THREE.MeshPhongMaterial({ color: 0x0b0c10, shininess: 30 });
+    const rimMat = new THREE.MeshPhongMaterial({ color: 0xc9cfd9, shininess: 120, specular: 0x8a93a6 });
+    const wheels: THREE.Mesh[] = [];
+    for (const [wx, wz] of [[-0.78, 1.44], [0.78, 1.44], [-0.78, -1.44], [0.78, -1.44]] as const) {
+      const w = new THREE.Mesh(tireGeo, tireMat);
+      w.add(new THREE.Mesh(rimGeo, rimMat));
+      w.position.set(wx, 0.34, wz);
+      g.add(w);
+      wheels.push(w);
+    }
+
+    // ── Model 3 face: black fascia + slim LED headlights ──
+    const fascia = new THREE.Mesh(
+      new THREE.BoxGeometry(1.62, 0.20, 0.08),
+      new THREE.MeshPhongMaterial({ color: 0x11151b, shininess: 60 }),
+    );
+    fascia.position.set(0, 0.44, 2.31);
+    g.add(fascia);
+    const headGeo = new THREE.BoxGeometry(0.58, 0.075, 0.09);
+    const headMat = new THREE.MeshBasicMaterial({ color: 0xd9ecff });
+    for (const x of [-0.60, 0.60]) {
+      const h = new THREE.Mesh(headGeo, headMat);
+      h.position.set(x, 0.615, 2.28);
+      h.rotation.y = x > 0 ? -0.16 : 0.16;
+      g.add(h);
+    }
+
+    // full-width rear light bar (dimmable → brake state)
+    const brake = new THREE.Mesh(
+      new THREE.BoxGeometry(1.66, 0.10, 0.06),
+      new THREE.MeshBasicMaterial({ color: 0x5a0f12 }),
+    );
+    brake.position.set(0, 0.70, -2.335);
+    g.add(brake);
+
+    // flush door handles + mirrors
+    const handleMat = new THREE.MeshPhongMaterial({ color: 0xb9c1cd, shininess: 100 });
+    for (const sz of [-0.62, 0.42]) {
+      for (const sx of [-1, 1]) {
+        const h = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.045, 0.20), handleMat);
+        h.position.set(sx * (W / 2 + 0.045), 0.80, sz);
+        g.add(h);
+      }
+    }
+    for (const sx of [-1, 1]) {
+      const stalk = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.035, 0.06), paint);
+      stalk.position.set(sx * 1.02, 0.97, 0.98);
+      const mir = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.10, 0.22), paint);
+      mir.position.set(sx * 1.08, 0.99, 0.98);
+      g.add(stalk, mir);
+    }
+
+    // headlight glow sprites (keep the VehicleMesh interface)
+    const texWhite = glowTexture("rgba(230,240,255,1)");
+    const mkLight = (x: number) => {
+      const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: texWhite, color: 0xdfe9ff, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+      spr.position.set(x, 0.62, 2.34);
+      spr.scale.set(1.0, 1.0, 1);
+      g.add(spr);
+      return spr;
+    };
+    const lightL = mkLight(-0.60);
+    const lightR = mkLight(0.60);
+
+    // blob shadow
+    const shadow = new THREE.Mesh(
+      new THREE.PlaneGeometry(2.2, 5.1),
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.38, depthWrite: false }),
+    );
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = 0.02;
+    g.add(shadow);
+
     // autopilot ring under the car
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(2.1, 2.75, 40),
@@ -735,28 +867,32 @@ export class Scene3D {
     );
     ring.rotation.x = -Math.PI / 2;
     ring.position.y = 0.05;
-    v.group.add(ring);
+    g.add(ring);
+
     // turn signals
     const texAmber = glowTexture("rgba(255,190,60,1)");
     const mkSig = (x: number) => {
       const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: texAmber, color: 0xffbe3c, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
       spr.position.set(x, 0.72, 1.9);
       spr.scale.set(1.4, 1.4, 1);
-      v.group.add(spr);
+      g.add(spr);
       return spr;
     };
     const signals = { l: mkSig(-0.95), r: mkSig(0.95) };
-    // headlight cones
+
+    // headlight beam cones (brighter at dusk)
     const cones: THREE.Mesh[] = [];
-    const coneMat = new THREE.MeshBasicMaterial({ color: 0xbcd6ff, transparent: true, opacity: 0.055, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
-    for (const x of [-0.62, 0.62]) {
+    const coneMat = new THREE.MeshBasicMaterial({ color: 0xbcd6ff, transparent: true, opacity: 0.09, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+    for (const x of [-0.60, 0.60]) {
       const cone = new THREE.Mesh(new THREE.ConeGeometry(2.6, 20, 12, 1, true), coneMat);
       cone.rotation.x = -Math.PI / 2 - 0.045;
       cone.position.set(x, 0.6, 12.2);
-      v.group.add(cone);
+      g.add(cone);
       cones.push(cone);
     }
-    return { ...v, signals, ring, cones };
+
+    this.world.add(g);
+    return { group: g, brake, lightL, lightR, signals, ring, cones, wheels };
   }
 
   /* ── per-frame update ────────────────────────────────────────── */
@@ -779,7 +915,25 @@ export class Scene3D {
     // Tesla
     const tes = this.tesla;
     tes.group.position.copy(carPos);
-    tes.group.rotation.y = Math.PI / 2 - carP.angle;
+    // smooth the yaw through corners (no snap at turn vertices)
+    const targetYaw = Math.PI / 2 - carP.angle;
+    if (this.carYaw === null) this.carYaw = targetYaw;
+    let yawD = targetYaw - this.carYaw;
+    yawD = Math.atan2(Math.sin(yawD), Math.cos(yawD));
+    this.carYaw += yawD * (1 - Math.exp(-dt * 7));
+    tes.group.rotation.y = this.carYaw;
+    // wheels roll with ground speed; front pair steers into maneuvers
+    this.wheelSpin = (this.wheelSpin + (rs.speedKmh / 3.6) * dt / 0.34) % (Math.PI * 2);
+    let steer = 0;
+    const manSoon = rs.nextManeuver;
+    if (manSoon && manSoon.distanceM < 26 && manSoon.distanceM > 2) {
+      if (manSoon.modifier === "left" || manSoon.modifier === "slight left") steer = 0.30;
+      else if (manSoon.modifier === "right" || manSoon.modifier === "slight right") steer = -0.30;
+    }
+    this.steerYaw += (steer - this.steerYaw) * (1 - Math.exp(-dt * 5));
+    tes.wheels.forEach((w, i) => {
+      w.rotation.set(this.wheelSpin, i % 2 === 0 ? this.steerYaw : this.steerYaw, Math.PI / 2);
+    });
     const braking = rs.accelCmd === "brake" || (tes.group.userData.prevS !== undefined && rs.s < tes.group.userData.prevS);
     (tes.brake.material as THREE.MeshBasicMaterial).color.set(braking ? 0xff2d2d : 0x5a0f12);
     tes.group.userData.prevS = rs.s;
@@ -912,16 +1066,17 @@ export class Scene3D {
       }
     }
 
-    // camera: elevated chase looking forward
+    // camera: elevated GTA-style chase — high and far enough that street
+    // canyons read as vistas instead of walls
     const desired = new THREE.Vector3(
-      carPos.x - fwdX * 10.5,
-      8.2,
-      carPos.z - fwdZ * 10.5,
+      carPos.x - fwdX * 13.5,
+      11.0,
+      carPos.z - fwdZ * 13.5,
     );
     const look = new THREE.Vector3(
-      carPos.x + fwdX * 15,
-      1.1,
-      carPos.z + fwdZ * 15,
+      carPos.x + fwdX * 20,
+      2.0,
+      carPos.z + fwdZ * 20,
     );
     const k = 1 - Math.exp(-dt * 4.2);
     this.camPos.lerp(desired, k);

@@ -146,15 +146,28 @@ export class Radar {
     ctx.restore();
 
     // fixed overlay: north letter orbiting with map rotation
-    const nDist = R - 16 * this.dpr;
+    const nDist = R - 13 * this.dpr;
     // direction of map-north (0,-1) after rotating by theta
     const rx = Math.sin(theta);
     const ry = -Math.cos(theta);
-    ctx.fillStyle = "rgba(226,232,240,0.9)";
-    ctx.font = `bold ${8 * this.dpr}px ui-sans-serif, system-ui`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("N", cx + rx * nDist, cy + ry * nDist);
+    // radial tick so the rotation reads at a glance
+    ctx.strokeStyle = "rgba(226,232,240,0.9)";
+    ctx.lineWidth = 2 * this.dpr;
+    ctx.beginPath();
+    ctx.moveTo(cx + rx * (nDist + 6.5 * this.dpr), cy + ry * (nDist + 6.5 * this.dpr));
+    ctx.lineTo(cx + rx * (nDist - 6 * this.dpr), cy + ry * (nDist - 6 * this.dpr));
+    ctx.stroke();
+    // bold N with dark halo, always legible over tiles
+    const nx = cx + rx * nDist;
+    const ny = cy + ry * nDist;
+    ctx.font = `bold ${10.5 * this.dpr}px ui-sans-serif, system-ui`;
+    ctx.lineWidth = 3 * this.dpr;
+    ctx.strokeStyle = "rgba(2,6,23,0.95)";
+    ctx.strokeText("N", nx, ny);
+    ctx.fillStyle = "#f8fafc";
+    ctx.fillText("N", nx, ny);
 
     // speed (bottom) + limit (top-left) inside the dial
     ctx.fillStyle = "#e2e8f0";
