@@ -619,6 +619,14 @@ function GameScreen({
                     </div>
                   </div>
                 )}
+                {/* transient event notice (dog scared, bump, aborted pass) */}
+                {snap?.notice && (
+                  <div className="absolute top-4 left-1/2 -translate-x-1/2 max-w-md">
+                    <div className="rounded-md border border-amber-500/50 bg-amber-950/85 backdrop-blur-sm px-3 py-1.5 text-xs text-amber-200 shadow-lg animate-pulse">
+                      {snap.notice.text}
+                    </div>
+                  </div>
+                )}
                 {/* speed-limit sign overlay */}
                 <div className="absolute top-5 right-5 flex flex-col items-center gap-1.5">
                   <div className="w-12 h-12 rounded-full border-4 border-white bg-slate-950 flex items-center justify-center shadow-lg">

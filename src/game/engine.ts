@@ -107,6 +107,8 @@ export interface Snapshot {
   crashReason: string | null;
   autopilot: boolean;
   emergency: boolean;
+  /** transient on-screen notice (dog scared, bump, aborted pass...) */
+  notice: { text: string; untilTick: number } | null;
 }
 
 export interface TripResult {
@@ -175,6 +177,7 @@ export class AutopilotGame {
   private decisionSentWall = 0;
   private stoppedTime = 0;
   private brakeTag: string | null = null;
+  private notice: { text: string; untilTick: number } | null = null;
   public incidentCauses: Record<string, number> = {};
   public overspeedS = 0; // time spent above limit+3 while moving
   public topOverKmh = 0; // worst overspeed vs current limit
@@ -474,6 +477,33 @@ export class AutopilotGame {
       if (ds > 0.5 && ds < 150 && (!best || t.s < best.s)) best = t;
     }
     return best;
+  }
+
+  /** Max arrival speed at a crossing entity such that we pass just after it
+   *  clears the danger band (+0.55 s margin). Shared by the AEB layer and the
+   *  anticipatory approach planner so both agree on what "safe" means.
+   *  Returns null if the entity never sweeps our lane band. */
+  private crossingArrivalCap(c: CrossingEntity, vMs: number): number | null {
+    const ds = c.s - this.s;
+    if (ds < -2) return null;
+    const lat = c.lateral - LANE;
+    const latV = (Math.sign(c.to - c.from) || 1) * c.speed;
+    const half = c.kind === "perro" ? 2.1 : 1.7;
+    const tArrive = ds / Math.max(vMs, 0.6);
+    const latThen = lat + latV * tArrive;
+    const lo = Math.min(lat, latThen);
+    const hi = Math.max(lat, latThen);
+    if (lo > half || hi < -half) return null;
+    let tLeave: number;
+    if (Math.abs(latV) < 0.05) {
+      tLeave = Math.abs(lat) < half ? Infinity : 0;
+    } else {
+      tLeave = (Math.sign(latV) * half - lat) / latV;
+      if (tLeave < 0) tLeave = 0;
+    }
+    let vAllowMs = ds / (tLeave + 0.55);
+    if (Math.abs(lat) < 1.1) vAllowMs = Math.min(vAllowMs, Math.max((ds - 3.2) / 1.5, 0));
+    return Math.max(0, Math.min(vAllowMs, c.kind === "perro" ? 3.0 : 4.5));
   }
 
   /** Would an oncoming car reach us before a pass completes? Time-based, not
@@ -874,6 +904,50 @@ export class AutopilotGame {
     const veh = this.vehicleAhead();
     const gapM = veh ? veh.distanceM : Infinity;
     const leader = this.nearestAhead();
+    // nearest same-direction blocker EXCLUDING the car we're actively passing:
+    // during a pass the target yields to the curb, but a SECOND stopped car
+    // beyond it must still be seen by the AEB and the approach planner
+    let blockVeh: TrafficCar | null = null;
+    for (const t of this.traffic) {
+      if (t.dir !== 1 || t.id === this.overtakeId) continue;
+      const ds = t.s - this.s;
+      if (ds > 0.5 && ds < 150 && (!blockVeh || ds < blockVeh.s - this.s)) blockVeh = t;
+    }
+
+    // ── anticipatory approach planner ──
+    // The AEB is anticipatory in decel but reactive in FEEL: cruise keeps
+    // pushing to the limit until the threat is ~40 m away, then sheds speed
+    // visibly late. This layer caps our speed from FAR out: for each threat,
+    // the max speed NOW from which a gentle 2.6 m/s² brake lands us exactly
+    // at the threat's allowed arrival speed. Braking becomes long, smooth
+    // and obviously deliberate instead of late and hard.
+    const COMFORT_MS2 = 2.6;
+    let threat: { dsEff: number; capMs: number } | null = null;
+    let approachCapMs = Infinity;
+    {
+      const vNow = this.speedKmh / 3.6;
+      const consider = (ds: number, dsEff: number, capMs: number) => {
+        const eff = Math.max(dsEff, 0);
+        const vMax = Math.sqrt(capMs * capMs + 2 * COMFORT_MS2 * eff);
+        if (vNow > vMax + 0.2 && vMax < approachCapMs) {
+          approachCapMs = vMax;
+          threat = { dsEff: eff, capMs };
+        }
+      };
+      for (const c of this.crossings) {
+        if (c.done) continue;
+        const ds = c.s - this.s;
+        if (ds < 2 || ds > 260) continue;
+        const cap = this.crossingArrivalCap(c, vNow);
+        if (cap === null) continue;
+        consider(ds, ds - 2, cap);
+      }
+      if (blockVeh) {
+        const ds = blockVeh.s - this.s;
+        if (ds > 2 && ds < 260) consider(ds, ds - 7.6, blockVeh.speedMs);
+      }
+    }
+    const approachCapKmh = approachCapMs * 3.6;
 
     // a much slower vehicle ahead is eventually "overtaken" (it leaves the
     // road or we change lanes) so the trip doesn't stall behind rolling
@@ -923,7 +997,7 @@ export class AutopilotGame {
       this.speedKmh = Math.max(0, this.speedKmh - EMERGENCY_BRAKE * dt);
       this.brakeTag = "emergency";
     } else if (this.cruiseActive && this.cruiseTargetKmh !== null && this.accelCmd !== "brake") {      // adaptive cruise: hold target, keep 2-second gap to vehicle ahead
-      const target = Math.min(this.cruiseTargetKmh, limit);
+      const target = Math.min(this.cruiseTargetKmh, limit, approachCapKmh);
       const safeGap = (this.speedKmh / 3.6) * 2 + 6;
       if (veh && gapM < safeGap) {
         this.speedKmh = Math.max(0, this.speedKmh - BRAKE * dt);
@@ -953,8 +1027,14 @@ export class AutopilotGame {
               this.speedKmh = Math.min(leaderV, this.speedKmh + ACCEL * 0.7 * dt);
             }
           } else {
-            // strict limit compliance: never use the road above its limit
-            this.speedKmh = Math.min(Math.max(limit, 20), MAX_SPEED, this.speedKmh + ACCEL * dt);
+            // strict limit compliance: never use the road above its limit;
+            // the approach cap may pull the ceiling down far below the limit
+            this.speedKmh = Math.min(
+              Math.max(limit, 20),
+              MAX_SPEED,
+              approachCapKmh,
+              this.speedKmh + ACCEL * dt
+            );
           }
           break;
         }
@@ -1031,6 +1111,20 @@ export class AutopilotGame {
         this.brakeTag = "limit-ahead";
       }
     }
+    // anticipatory approach braking: follow the gentle profile from the
+    // planner above. This runs every tick (even when Jev says accelerate)
+    // because the perception text may lag a freshly-appeared threat; the
+    // planner sees the world directly every sub-step.
+    if (!this.emergency && threat && this.speedKmh > approachCapKmh + 1) {
+      const vNowMs = this.speedKmh / 3.6;
+      const needMs2 = Math.max(
+        0,
+        (vNowMs * vNowMs - threat.capMs * threat.capMs) / (2 * Math.max(threat.dsEff, 1))
+      );
+      const decel = Math.min(BRAKE * 0.6, Math.max(COMFORT_MS2 * 0.8, needMs2 * 3.6));
+      this.speedKmh = Math.max(threat.capMs * 3.6, this.speedKmh - decel * dt);
+      this.brakeTag = "approach";
+    }
     // wait-then-overtake: a STOPPED or CRAWLING (<15 km/h) car blocks our lane.
     // Real behaviour: wait a few seconds with the left indicator on, then pass
     // it slowly while it yields toward the curb — but ONLY when the oncoming
@@ -1050,6 +1144,12 @@ export class AutopilotGame {
       if (done || resumed || oncomingNow) {
         this.overtakeId = null; // passed / it drove off / yield to oncoming
         this.overtakeReturnT = 2.5; // right indicator while rejoining the lane
+        if (oncomingNow && !done && !resumed) {
+          this.notice = {
+            text: "Adelantamiento abortado: coche en sentido contrario — nos reincorporamos",
+            untilTick: this.tick + 240,
+          };
+        }
       } else {
         t.latOff = Math.min(1.35, (t.latOff ?? 0) + dt * 0.9); // it yields to the curb
         this.teslaLat = Math.max(LANE - 1.05, this.teslaLat - dt * 0.9); // we hug the line
@@ -1078,6 +1178,10 @@ export class AutopilotGame {
         if (this.blockedWaitS > 5) {
           this.overtakeId = leader.id; // enough waiting — pass it slowly
           this.blockedWaitS = 0;
+          this.notice = {
+            text: "Adelantando al vehículo lento — intermitente izquierdo",
+            untilTick: this.tick + 200,
+          };
         }
       } else {
         this.blockedWaitS = Math.max(0, this.blockedWaitS - dt * 2);
@@ -1118,31 +1222,8 @@ export class AutopilotGame {
         if (c.done) continue;
         const ds = c.s - this.s;
         if (ds < -2 || ds > scanM) continue;
-        const lat = c.lateral - LANE; // signed offset from our lane centre
-        const latV = (Math.sign(c.to - c.from) || 1) * c.speed;
-        // danger half-width: dog gets extra margin (erratic)
-        const half = c.kind === "perro" ? 2.1 : 1.7;
-        // will they sweep the danger band before we pass?
-        const tArrive = ds / Math.max(vMs, 0.6);
-        const latThen = lat + latV * tArrive;
-        const lo = Math.min(lat, latThen);
-        const hi = Math.max(lat, latThen);
-        if (lo > half || hi < -half) continue; // never in our path
-        // when do they LEAVE the band? (0 = already out on the far side;
-        // Infinity = stopped inside it → we must stop before them)
-        let tLeave: number;
-        if (Math.abs(latV) < 0.05) {
-          tLeave = Math.abs(lat) < half ? Infinity : 0;
-        } else {
-          tLeave = (Math.sign(latV) * half - lat) / latV;
-          if (tLeave < 0) tLeave = 0;
-        }
-        // arrive only after they clear (+margin); a stopped walker drives
-        // vAllow → 0 = full stop behind them
-        let vAllowMs = ds / (tLeave + 0.55);
-        // directly in front of us RIGHT NOW: creep to ~3.2 m behind them
-        if (Math.abs(lat) < 1.1) vAllowMs = Math.min(vAllowMs, Math.max((ds - 3.2) / 1.5, 0));
-        vAllowMs = Math.max(0, Math.min(vAllowMs, c.kind === "perro" ? 3.0 : 4.5));
+        const vAllowMs = this.crossingArrivalCap(c, vMs);
+        if (vAllowMs === null) continue; // never sweeps our lane band
         if (vMs > vAllowMs + 0.25) {
           const needMs2 = (vMs * vMs - vAllowMs * vAllowMs) / (2 * Math.max(ds - 1.5, 1));
           // exact needed decel when possible; a true close call (<12 m) brakes hard
@@ -1157,16 +1238,19 @@ export class AutopilotGame {
       // distance a comfortable 3.5 m/s² stop needs plus a small buffer — so
       // even a motorway-speed approach to a stopped car starts braking in
       // time (before, the fixed 34 m window made 120→0 a guaranteed crash).
-      if (veh && (!leader || leader.id !== this.overtakeId)) {
-        const leaderMs = leader ? leader.speedMs : 0;
+      // Scans every same-direction car except the overtake target: a second
+      // stopped car beyond the pass target used to be completely unseen.
+      if (blockVeh) {
+        const leaderMs = blockVeh.speedMs;
+        const gapBlockM = blockVeh.s - this.s;
         const closingMs = vMs - leaderMs;
         const window = Math.min(150, (closingMs * closingMs) / 7 + 14);
-        if (closingMs > 0.4 && gapM < window) {
+        if (closingMs > 0.4 && gapBlockM < window) {
           // aim to MATCH the leader's speed with a real 3 m bumper buffer
-          // (gapM is centre distance, CAR_LEN_M = 4.6). Targeting the old
+          // (gap is centre distance, CAR_LEN_M = 4.6). Targeting the old
           // zero buffer turned the last metres into discrete-time chicken:
           // residual closing at contact > 18 km/h registered as a crash.
-          const needMs2 = (closingMs * closingMs) / (2 * Math.max(gapM - 7.6, 1));
+          const needMs2 = (closingMs * closingMs) / (2 * Math.max(gapBlockM - 7.6, 1));
           const decel = Math.min(EMERGENCY_BRAKE, Math.max(5, needMs2 * 3.6));
           if (vMs > leaderMs + 0.3) {
             this.speedKmh = Math.max(leaderMs * 3.6, this.speedKmh - decel * dt);
@@ -1225,30 +1309,51 @@ export class AutopilotGame {
         if (c.kind === "perro" && this.speedKmh <= 18) {
           this.incidents++;
           this.score = Math.max(0, this.score - 60);
-          c.done = true; // scared dog runs off
+          // scared dog visibly bolts back to where it came from — otherwise
+          // it just froze and the player couldn't tell hit from near-miss
+          c.done = true;
+          c.to = c.from + (Math.sign(c.from - c.to) || 1) * 0.5;
+          c.speed = Math.max(c.speed * 2.2, 4.2);
+          this.notice = {
+            text: "¡Perro asustado! Se escapó por poco — frena antes (−60 pts)",
+            untilTick: this.tick + 240, // ~4 s at 60 fps
+          };
         } else {
           return this.crash(`Atropello a un${c.kind === "perro" ? " perro" : " peatón"}`);
         }
       }
     }
 
-    // rear-end: vehicles are SOLID at any speed. Bumper-to-bumper distance is
-    // ds - CAR_LEN_M, so contact happens at ds ≈ CAR_LEN_M (the old trigger at
-    // CAR_LEN_M*0.55 plus a speed>10 gate let slow cars be ghosted through).
-    // While we are overtaking a stopped car we are laterally separated from
-    // it, so it is exempt from the clamp (we must be allowed to get alongside).
-    const passing = leader !== null && leader.id === this.overtakeId;
-    if (veh && gapM <= CAR_LEN_M + 0.4 && !passing) {
-      const closing = leader ? this.speedKmh - leader.speedMs * 3.6 : 99;
-      if (closing > 18) {
-        return this.crash(`Colisión por alcance con ${veh.type}`);
+    // ── HARD INVARIANT: car bodies never overlap ──
+    // Final net after the move: for EVERY same-direction car, if we are
+    // longitudinally overlapped (|ds| < CAR_LEN_M) we must be laterally clear
+    // (a pass in progress, ≥1.6 m between body centres). Anything else is
+    // resolved THIS tick: violent impact (>25 km/h closing) = crash; a gentle
+    // bump = incident + match speed + get shoved to their bumper. There is no
+    // exemption by id: even if the overtake bookkeeping glitched, a true pass
+    // is always laterally separated, so legitimate passes are untouched.
+    for (const t of this.traffic) {
+      if (t.dir !== 1) continue;
+      const ds = t.s - this.s;
+      if (ds >= CAR_LEN_M + 0.3 || ds <= -CAR_LEN_M - 0.3) continue;
+      const theirLat = LANE + (t.latOff ?? 0);
+      if (Math.abs(theirLat - this.teslaLat) >= 1.6) continue; // pass in progress
+      const closing = this.speedKmh - t.speedMs * 3.6;
+      const kindName: Record<string, string> = {
+        car: "coche", taxi: "taxi", truck: "camión", police: "coche de policía", ambulance: "ambulancia",
+      };
+      if (closing > 25) {
+        return this.crash(`Colisión por alcance con ${kindName[t.kind] ?? "vehículo"}`);
       }
-      // light contact: count an incident, match speed, never pass through
       this.incidents++;
       this.score = Math.max(0, this.score - 50);
-      this.speedKmh = Math.max(0, leader ? leader.speedMs * 3.6 : 0);
+      this.speedKmh = Math.max(0, Math.min(this.speedKmh, t.speedMs * 3.6));
       this.brakeTag = "rear-end";
-      if (leader) this.s = Math.min(this.s, leader.s - CAR_LEN_M - 0.3);
+      this.notice = {
+        text: `Toque con el ${kindName[t.kind] ?? "vehículo"} de delante — distancia insuficiente (−50 pts)`,
+        untilTick: this.tick + 240,
+      };
+      if (ds > 0) this.s = Math.min(this.s, t.s - CAR_LEN_M - 0.3);
     }
 
     this.maybeDecide(dt);
@@ -1294,6 +1399,10 @@ export class AutopilotGame {
       crashReason: this.crashReason,
       autopilot: this.mode === "autopilot",
       emergency: this.emergency,
+      notice:
+        this.notice && this.tick < this.notice.untilTick
+          ? { text: this.notice.text, untilTick: this.notice.untilTick }
+          : null,
     };
   }
 
