@@ -757,20 +757,29 @@ export class Scene3D {
     }
   }
 
-  /** parked cars hugging the right curb on calm urban stretches */
+  /** parked cars hugging the right curb on calm urban stretches — ONLY where
+   *  a real parking lane fits. These are decorative: the physics engine
+   *  doesn't know them, so if a parked body intrudes into the drivable
+   *  corridor the Tesla visibly drives through it ("choca sin esquivar").
+   *  Our lane sits at +laneOffset with a 1.86 m body, so a parked car needs
+   *  its inner edge ≥ laneOffset + 0.93 (our outer edge) + ~0.35 m margin:
+   *  off − 0.93 ≥ laneOffset + 1.28  ⇒  h ≥ ~5.16. Narrower streets get no
+   *  parked cars at all — exactly like real cities without a parking lane. */
   private buildParkedCars(rs: RenderState) {
     const manS = stepsToS(rs);
     const nearMan = (s: number) => manS.some((m) => Math.abs(m - s) < 26);
+    const CAR_HALF = 0.93;
+    const minOff = rs.laneOffset + CAR_HALF + 0.35 + CAR_HALF; // 4.11 with laneOffset 1.9
     let n = 0;
     for (let s = 40; s < rs.poly.total - 30; s += 34, n++) {
       if (nearMan(s) || this.limitAt(rs, s) >= 80) continue;
       if (hash(n * 11.3) < 0.45) continue; // plenty of gaps
       const p = rs.poly.at(s);
       const h = roadHalfAt(rs.steps, s);
-      if (h < 3.6) continue; // no parking on the narrowest lanes
+      if (h < minOff + 0.05) continue; // no parking lane → no parked cars
       const nx = Math.cos(p.angle + Math.PI / 2);
       const nz = Math.sin(p.angle + Math.PI / 2);
-      const off = h - 1.05;
+      const off = Math.max(h - 1.05, minOff);
       const color = ["#6b7280", "#8e99a8", "#4b5563", "#7a8699", "#5c6470"][Math.floor(hash(n * 3.7) * 5)];
       const v = this.makeVehicle("car", color);
       v.group.position.set(p.x + nx * off, 0, p.y + nz * off);
