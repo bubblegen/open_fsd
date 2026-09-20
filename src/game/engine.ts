@@ -34,6 +34,21 @@ const MANEUVER_SAFE_THRESHOLD = 0.4;
 const HARD_BRAKE_INCIDENT = 34; // above BRAKE (30): only true emergency braking counts
 const LANE = 1.9; // meters, right-hand traffic
 const CAR_LEN_M = 4.6;
+/** body widths MUST match the 3D boxes in scene3d.ts — physics and visuals
+ *  share one geometry so "never overlap" is true on screen, not just in math */
+const CAR_WIDTH_M = 1.86; // Tesla body BoxGeometry width
+const BODY_CLEARANCE_M = 0.45; // min mirror-to-mirror clearance side-by-side
+const TRAFFIC_WIDTH: Record<TrafficKind, number> = {
+  car: 1.86,
+  taxi: 1.86,
+  truck: 2.3, // cargo box in scene3d
+  police: 1.9,
+  ambulance: 1.9,
+};
+/** lateral centre-to-centre clearance needed so two bodies never touch */
+function latClearNeed(theirKind: TrafficKind): number {
+  return (CAR_WIDTH_M + TRAFFIC_WIDTH[theirKind]) / 2 + BODY_CLEARANCE_M;
+}
 const ARRIVE_WINDOW_M = 12;
 
 /* ────────────────────────────────────────────────────────────────
@@ -177,6 +192,10 @@ export class AutopilotGame {
   private decisionSentWall = 0;
   private stoppedTime = 0;
   private brakeTag: string | null = null;
+  private maneuverIncidentArmed = false;
+  /** car that keeps yielding to the curb while we hold our lateral offset
+   *  after an aborted pass (until we're longitudinally clear of each other) */
+  private holdYieldId: number | null = null;
   private notice: { text: string; untilTick: number } | null = null;
   public incidentCauses: Record<string, number> = {};
   public overspeedS = 0; // time spent above limit+3 while moving
@@ -784,15 +803,22 @@ export class AutopilotGame {
 
     // risky maneuver → slow down to take it; but never deadlock: once slow,
     // creep up to the junction so the maneuver distance keeps shrinking and
-    // Jev gets a chance to mark it safe again
+    // Jev gets a chance to mark it safe again. The incident is counted ONCE
+    // per approach (edge-triggered): the old code added one every decision
+    // tick above 55 km/h, drowning the real incident count
     if (!this.emergency && maneuverSafe < MANEUVER_SAFE_THRESHOLD) {
       if (this.speedKmh > 35) {
         // slow down progressively for the maneuver, not an emergency stop
         this.accelCmd = "brake";
-        if (this.speedKmh > 55) this.incidents++;
+        if (this.speedKmh > 55 && !this.maneuverIncidentArmed) {
+          this.incidents++;
+          this.maneuverIncidentArmed = true;
+        }
       } else {
         this.accelCmd = "maintain";
       }
+    } else if (this.speedKmh < 30) {
+      this.maneuverIncidentArmed = false; // re-arm once slow again
     }
 
     const view = this.currentDecision;
@@ -845,7 +871,9 @@ export class AutopilotGame {
     const ourLimit = this.currentLimit();
     for (const t of this.traffic) {
       // a car we squeezed past drifts back to its lane once the pass is over
-      if (t.id !== this.overtakeId) {
+      // — EXCEPT the one we're holding beside after an aborted pass: it must
+      // keep its curb-side yield while our bodies are longitudinally overlapped
+      if (t.id !== this.overtakeId && t.id !== this.holdYieldId) {
         t.latOff = Math.max(0, (t.latOff ?? 0) - dt * 0.6);
       }
       // traffic obeys the limit signs of the stretch it is on: vehicles
@@ -957,10 +985,21 @@ export class AutopilotGame {
       if (t.dir !== 1) continue;
       const ds = t.s - this.s;
       // genuinely dawdling cars only (a 42-in-a-50 is normal flow, keep it);
-      // stopped cars are handled by the wait-then-overtake flow, not removed
-      if (ds > 0.5 && ds < 60 && t.speedMs * 3.6 < limit * 0.5 && t.speedMs * 3.6 >= 3) slowAhead = t;
+      // stopped cars are handled by the wait-then-overtake flow, not removed.
+      // NEVER the car we're passing or waiting on, and never one our body
+      // overlaps: deleting it mid-pass made done=true fire at ds≈0, the pass
+      // "finished" instantly and we relaxed the lateral offset straight
+      // through its body — the exact "atravesar" the width fix targets
+      const bodyClear = ds > CAR_LEN_M + 1.5;
+      const notPassTarget =
+        t.id !== this.overtakeId && t.id !== this.holdYieldId && this.blockedWaitS <= 0.01;
+      if (
+        ds > 0.5 && ds < 60 && bodyClear && notPassTarget &&
+        t.speedMs * 3.6 < limit * 0.5 && t.speedMs * 3.6 >= 3
+      )
+        slowAhead = t;
     }
-    if (slowAhead && this.speedKmh < limit * 0.55) {
+    if (slowAhead && this.overtakeId === null && this.speedKmh < limit * 0.55) {
       this.stuckBehindS += dt;
       // long fuse: the overtake flow gets first crack at anything under 15
       // km/h; this only clears true rolling roadblocks (they "took an exit")
@@ -1028,13 +1067,17 @@ export class AutopilotGame {
             }
           } else {
             // strict limit compliance: never use the road above its limit;
-            // the approach cap may pull the ceiling down far below the limit
-            this.speedKmh = Math.min(
-              Math.max(limit, 20),
-              MAX_SPEED,
-              approachCapKmh,
-              this.speedKmh + ACCEL * dt
-            );
+            // the approach cap may pull the ceiling down far below the limit.
+            // Descend toward the ceiling at a real brake rate — a hard
+            // Math.min the tick a zone line starts reads as a fake 200 km/h/s
+            // "hard brake" incident (the limit-ahead shed normally prevents
+            // this; this is the never-instant net)
+            const ceiling = Math.min(Math.max(limit, 20), MAX_SPEED, approachCapKmh);
+            if (this.speedKmh > ceiling) {
+              this.speedKmh = Math.max(ceiling, this.speedKmh - BRAKE * 0.8 * dt);
+            } else {
+              this.speedKmh = Math.min(ceiling, this.speedKmh + ACCEL * dt);
+            }
           }
           break;
         }
@@ -1086,15 +1129,18 @@ export class AutopilotGame {
         }
       }
     }
-    // proactive limit compliance: if a LOWER limit starts within ~170 m,
+    // proactive limit compliance: if a LOWER limit starts within ~450 m,
     // shed speed with a comfortable decel so we enter the zone at the limit
-    // (never blast through a 30 sign at the previous road's speed)
+    // (never blast through a 30 sign at the previous road's speed). The wide
+    // horizon matters: a 90→30 drop needs ~300 m at a gentle 2.5 m/s² — with
+    // only 170 m the shed arrives hot and the hard ceiling clamp below fired
+    // instantly, registering fake "hard brake" incidents at every zone line
     if (!this.emergency && this.accelCmd !== "brake") {
       let zoneS = Infinity;
       let zoneLim = Infinity;
       for (const st of this.steps) {
         if (st.s <= this.s + 3) continue;
-        if (st.s > this.s + 170) break;
+        if (st.s > this.s + 450) break;
         const l = limitForStep(st, st.index);
         if (l < zoneLim) {
           zoneLim = l;
@@ -1142,6 +1188,13 @@ export class AutopilotGame {
       const gapNow = t ? t.s - this.s : Infinity;
       const oncomingNow = this.oncomingConflict(gapNow, passNow, leaderKmhNow);
       if (done || resumed || oncomingNow) {
+        if (typeof process !== "undefined" && process.env?.OFSD_DEBUG_BUMP) {
+          console.log(`[abort] tick=${this.tick} done=${done} resumed=${resumed} oncoming=${oncomingNow} ds=${gapNow.toFixed(2)} leadKmh=${leaderKmhNow.toFixed(1)} tDir=${t?.dir} tSpeed=${((t?.speedMs ?? 0) * 3.6).toFixed(1)}`);
+        }
+        // aborted while still beside it: the car KEEPS yielding to the curb
+        // (holdYieldId) until we're longitudinally clear, so the lateral
+        // corridor never collapses back below latClearNeed mid-overlap
+        if (oncomingNow && !done && !resumed) this.holdYieldId = this.overtakeId;
         this.overtakeId = null; // passed / it drove off / yield to oncoming
         this.overtakeReturnT = 2.5; // right indicator while rejoining the lane
         if (oncomingNow && !done && !resumed) {
@@ -1151,18 +1204,44 @@ export class AutopilotGame {
           };
         }
       } else {
-        t.latOff = Math.min(1.35, (t.latOff ?? 0) + dt * 0.9); // it yields to the curb
-        this.teslaLat = Math.max(LANE - 1.05, this.teslaLat - dt * 0.9); // we hug the line
-        // pass at walking-to-brisk pace relative to the leader, never flat out
-        this.speedKmh = Math.min(this.speedKmh, passNow);
-        if (this.speedKmh < passNow - 1) {
-          this.speedKmh = Math.min(passNow, this.speedKmh + 4 * dt);
+        // lateral shifts sized by BODY WIDTH: separation must clear
+        // latClearNeed(kind) (2.31 m car, 2.53 m truck) with margin — the
+        // old fixed 1.05/1.35 shift gave 2.40 m, under the truck requirement
+        t.latOff = Math.min(1.5, (t.latOff ?? 0) + dt * 1.3); // it yields to the curb
+        this.teslaLat = Math.max(LANE - 1.2, this.teslaLat - dt * 1.3); // we hug the line
+        // LATERAL FIRST: while the bodies are not yet width-clear, creep at
+        // barely-over-leader pace so the corridor builds BEFORE longitudinal
+        // overlap — no more rear quarter clipped on entry
+        const latSep = (t.latOff ?? 0) + (LANE - this.teslaLat);
+        const need = latClearNeed(t.kind);
+        const entryCreepKmh = Math.min(passNow, leaderKmhNow + 2);
+        const capNow = latSep < need ? entryCreepKmh : passNow;
+        // pass at walking-to-brisk pace relative to the leader, never flat out.
+        // Rate-limit the descent to a real brake — an instant Math.min slash
+        // reads as a fake hard-brake incident (>34 km/h/s) on the entry tick
+        if (this.speedKmh > capNow) {
+          this.speedKmh = Math.max(capNow, this.speedKmh - BRAKE * dt);
+        } else if (this.speedKmh < capNow - 1) {
+          this.speedKmh = Math.min(capNow, this.speedKmh + 4 * dt);
         }
       }
     }
     if (this.overtakeId === null) {
-      // relax back into our lane once the pass is done (or was aborted)
-      this.teslaLat += (LANE - this.teslaLat) * Math.min(1, dt * 1.2);
+      // relax back into our lane once the pass is done — BUT if we aborted
+      // alongside the car, hold the lateral offset until we're longitudinally
+      // clear of its body, then rejoin; dropping back to lane centre while
+      // |ds| < CAR_LEN_M is exactly how the car "passed through" them
+      const alongside = this.traffic.find((t) => {
+        if (t.dir !== 1) return false;
+        const ds = Math.abs(t.s - this.s);
+        return ds < CAR_LEN_M + 1;
+      });
+      if (!alongside) {
+        this.teslaLat += (LANE - this.teslaLat) * Math.min(1, dt * 1.2);
+        // longitudinally clear of the car we aborted beside: it may drift
+        // back to its lane now, and our lateral hold is over
+        this.holdYieldId = null;
+      }
       const leaderKmh = leader ? leader.speedMs * 3.6 : 999;
       const stuckBehindStopped = this.speedKmh < 5;
       const dawdlingBehindCrawler =
@@ -1277,6 +1356,11 @@ export class AutopilotGame {
 
     const decel = (prevSpeed - this.speedKmh) / Math.max(dt, 0.001);
     if (decel > HARD_BRAKE_INCIDENT && this.lastDecel <= HARD_BRAKE_INCIDENT) {
+      if (typeof process !== "undefined" && process.env?.OFSD_DEBUG_BUMP) {
+        console.log(
+          `[hard] tick=${this.tick} decel=${decel.toFixed(1)} prev=${prevSpeed.toFixed(1)} now=${this.speedKmh.toFixed(1)} tag=${this.brakeTag} cmd=${this.accelCmd} ot=${this.overtakeId} em=${this.emergency}`,
+        );
+      }
       this.incidents++;
       this.incidentCauses[this.brakeTag ?? "unknown"] =
         (this.incidentCauses[this.brakeTag ?? "unknown"] ?? 0) + 1;
@@ -1308,6 +1392,7 @@ export class AutopilotGame {
       if (ds < 2.2 && Math.abs(c.lateral - carLat) < 1.4 && this.speedKmh > 3) {
         if (c.kind === "perro" && this.speedKmh <= 18) {
           this.incidents++;
+          this.incidentCauses["perro-asustado"] = (this.incidentCauses["perro-asustado"] ?? 0) + 1;
           this.score = Math.max(0, this.score - 60);
           // scared dog visibly bolts back to where it came from — otherwise
           // it just froze and the player couldn't tell hit from near-miss
@@ -1327,17 +1412,18 @@ export class AutopilotGame {
     // ── HARD INVARIANT: car bodies never overlap ──
     // Final net after the move: for EVERY same-direction car, if we are
     // longitudinally overlapped (|ds| < CAR_LEN_M) we must be laterally clear
-    // (a pass in progress, ≥1.6 m between body centres). Anything else is
-    // resolved THIS tick: violent impact (>25 km/h closing) = crash; a gentle
-    // bump = incident + match speed + get shoved to their bumper. There is no
-    // exemption by id: even if the overtake bookkeeping glitched, a true pass
-    // is always laterally separated, so legitimate passes are untouched.
+    // by a full body width + clearance (width-aware: a truck needs more than
+    // a car). Anything else is resolved THIS tick: violent impact (>25 km/h
+    // closing) = crash; a gentle bump = incident + match speed + get shoved
+    // to their bumper. There is no exemption by id: even if the overtake
+    // bookkeeping glitched, a true pass is always laterally separated, so
+    // legitimate passes are untouched.
     for (const t of this.traffic) {
       if (t.dir !== 1) continue;
       const ds = t.s - this.s;
       if (ds >= CAR_LEN_M + 0.3 || ds <= -CAR_LEN_M - 0.3) continue;
       const theirLat = LANE + (t.latOff ?? 0);
-      if (Math.abs(theirLat - this.teslaLat) >= 1.6) continue; // pass in progress
+      if (Math.abs(theirLat - this.teslaLat) >= latClearNeed(t.kind)) continue; // pass in progress
       const closing = this.speedKmh - t.speedMs * 3.6;
       const kindName: Record<string, string> = {
         car: "coche", taxi: "taxi", truck: "camión", police: "coche de policía", ambulance: "ambulancia",
@@ -1345,7 +1431,13 @@ export class AutopilotGame {
       if (closing > 25) {
         return this.crash(`Colisión por alcance con ${kindName[t.kind] ?? "vehículo"}`);
       }
+      if (typeof process !== "undefined" && process.env?.OFSD_DEBUG_BUMP) {
+        console.log(
+          `[bump] tick=${this.tick} s=${this.s.toFixed(1)} ds=${ds.toFixed(2)} ourV=${this.speedKmh.toFixed(1)} theirV=${(t.speedMs * 3.6).toFixed(1)} latSep=${Math.abs(theirLat - this.teslaLat).toFixed(2)} ot=${this.overtakeId} hold=${this.holdYieldId} tag=${this.brakeTag}`,
+        );
+      }
       this.incidents++;
+      this.incidentCauses["rear-end"] = (this.incidentCauses["rear-end"] ?? 0) + 1;
       this.score = Math.max(0, this.score - 50);
       this.speedKmh = Math.max(0, Math.min(this.speedKmh, t.speedMs * 3.6));
       this.brakeTag = "rear-end";

@@ -55,6 +55,12 @@ async function main() {
           id: 7777, s: e.s + 90, dir: 1, speedMs: 0, baseSpeedMs: 0,
           kind: "truck", color: "#c2a25c", changing: false, latOff: 0,
         };
+      } else {
+        // re-parking the SAME van for a later window: place it 90 m ahead
+        // again — a truck materialising 5 m in front is a script artifact,
+        // not a scenario the engine should ever face
+        van.s = e.s + 90;
+        van.latOff = 0;
       }
       van.speedMs = 0; van.baseSpeedMs = 0;
       if (!e.traffic.includes(van)) e.traffic.push(van);
@@ -83,6 +89,7 @@ async function main() {
     }
   }
   console.log(`viaje: ${ended ? `${ended.crashed ? "CRASH" : "fin"} (${ended.reason})` : "siguió"} a los ${e.simTime?.toFixed(0)}s | incidentes=${e.incidents}`);
+  console.log(`causas: ${JSON.stringify(e.incidentCauses)}`);
   console.log(`adelantamientos: ${passes.length}`);
   for (const p of passes) {
     console.log(`  t=${p.t.toFixed(0)}s v_max=${p.v.toFixed(1)} km/h sep=${p.lat.toFixed(2)} m contrario_cerca=${p.oncoming}`);

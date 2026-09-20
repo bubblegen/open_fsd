@@ -20,6 +20,8 @@ const ROUTE_URL =
 
 const CAR_LEN_M = 4.6;
 const LANE = 1.9;
+// same geometry as the engine's hard invariant: bodies 1.86 wide + clearance
+const LAT_CLEAR = (1.86 + 1.86) / 2 + 0.45;
 
 const accelerateMostly = (_s: PerceptionState): Promise<DecideResponse> =>
   Promise.resolve({
@@ -147,7 +149,7 @@ async function main() {
         const latSep = Math.abs(LANE + (t.latOff ?? 0) - ourLat);
         const gap = Math.abs(ds) - CAR_LEN_M; // bumper-to-bumper
         if (gap < worstGap) worstGap = gap;
-        if (Math.abs(ds) < CAR_LEN_M - 0.05 && latSep < 1.6) {
+        if (Math.abs(ds) < CAR_LEN_M - 0.05 && latSep < LAT_CLEAR) {
           violations++;
           console.error(
             `VIOLACIÓN run=${run} t=${simT.toFixed(1)}s ds=${ds.toFixed(2)} latSep=${latSep.toFixed(2)} v=${((engine as unknown as { speedKmh: number }).speedKmh).toFixed(1)}`
